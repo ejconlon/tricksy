@@ -1,0 +1,82 @@
+name: tricksy
+version: 0.1.0
+
+github: ejconlon/tricksy
+license: AllRightsReserved
+author: Eric Conlon
+maintainer: ejconlon@gmail.com
+copyright: (c) 2023 Eric Conlon
+synopsis: A simple TUI tracker
+description: Please see the README on GitHub at <https://github.com/ejconlon/tricksy#readme>
+tested-with: GHC == 9.2.7
+
+language: GHC2021
+
+extra-source-files:
+- README.md
+
+dependencies:
+- base >= 4.12 && < 5
+
+default-extensions:
+- BangPatterns
+- ConstraintKinds
+- DataKinds
+- DeriveFunctor
+- DeriveFoldable
+- DeriveGeneric
+- DeriveTraversable
+- DerivingStrategies
+- DerivingVia
+- FlexibleContexts
+- FlexibleInstances
+- FunctionalDependencies
+- GADTs
+- GeneralizedNewtypeDeriving
+- LambdaCase
+- KindSignatures
+- MultiParamTypeClasses
+- Rank2Types
+- ScopedTypeVariables
+- StandaloneDeriving
+- TupleSections
+- TypeApplications
+- TypeOperators
+- TypeFamilies
+
+ghc-options:
+- -Wall
+- -Wcompat
+- -Widentities
+- -Wincomplete-record-updates
+- -Wincomplete-uni-patterns
+- -Wpartial-fields
+- -Wredundant-constraints
+- -fno-warn-unused-top-binds
+
+library:
+  source-dirs: src
+
+executables:
+  tricksy-exe:
+    main: Main.hs
+    source-dirs: exe
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - tricksy
+
+tests:
+  tricksy-test:
+    main: Main.hs
+    source-dirs: test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - tricksy
+    - tasty
+    - tasty-hunit
