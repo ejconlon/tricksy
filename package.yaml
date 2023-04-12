@@ -17,6 +17,16 @@ extra-source-files:
 
 dependencies:
 - base >= 4.12 && < 5
+- deepseq
+- brick
+- vty
+- containers
+- text
+- bytestring
+- mtl
+- vector
+- async
+- stm
 
 default-extensions:
 - BangPatterns

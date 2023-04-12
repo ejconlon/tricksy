@@ -27,6 +27,7 @@ source-repository head
 library
   exposed-modules:
       Tricksy.Main
+      Tricksy.Time
   other-modules:
       Paths_tricksy
   hs-source-dirs:
@@ -58,7 +59,17 @@ library
       TypeFamilies
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints -fno-warn-unused-top-binds
   build-depends:
-      base >=4.12 && <5
+      async
+    , base >=4.12 && <5
+    , brick
+    , bytestring
+    , containers
+    , deepseq
+    , mtl
+    , stm
+    , text
+    , vector
+    , vty
   default-language: GHC2021
 
 executable tricksy-exe
@@ -94,8 +105,18 @@ executable tricksy-exe
       TypeFamilies
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints -fno-warn-unused-top-binds -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base >=4.12 && <5
+      async
+    , base >=4.12 && <5
+    , brick
+    , bytestring
+    , containers
+    , deepseq
+    , mtl
+    , stm
+    , text
     , tricksy
+    , vector
+    , vty
   default-language: GHC2021
 
 test-suite tricksy-test
@@ -132,8 +153,18 @@ test-suite tricksy-test
       TypeFamilies
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints -fno-warn-unused-top-binds -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base >=4.12 && <5
+      async
+    , base >=4.12 && <5
+    , brick
+    , bytestring
+    , containers
+    , deepseq
+    , mtl
+    , stm
     , tasty
     , tasty-hunit
+    , text
     , tricksy
+    , vector
+    , vty
   default-language: GHC2021

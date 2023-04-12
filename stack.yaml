@@ -5,3 +5,5 @@ ghc-options:
 
 packages:
 - .
+
+extra-deps: []
