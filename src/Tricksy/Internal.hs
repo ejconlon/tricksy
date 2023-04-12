@@ -242,11 +242,11 @@ accumE f s0 e = Events $ \cb -> do
   sVar <- newTVarIO s0
   consumeE e (\a -> atomically (stateTVar sVar (f a)) >>= cb)
 
-accumMayE :: (a -> s -> Maybe (b, s)) -> s -> Events a -> Events b
+accumMayE :: (a -> s -> (Maybe b, s)) -> s -> Events a -> Events b
 accumMayE f s0 e = Events $ \cb -> do
   sVar <- newTVarIO s0
   consumeE e $ \a -> do
-    mb <- atomically (stateTVar sVar (\s -> maybe (Nothing, s) (first Just) (f a s)))
+    mb <- atomically (stateTVar sVar (f a))
     maybe (pure ActiveYes) cb mb
 
 filterE :: (a -> Bool) -> Events a -> Events a
@@ -256,16 +256,10 @@ filterJustE :: Events (Maybe a) -> Events a
 filterJustE e = Events (consumeE e . maybe (pure ActiveYes))
 
 leftE :: Events (Either a b) -> Events a
-leftE e = Events (\cb -> consumeE e (either cb (const (pure ActiveYes))))
+leftE = mapMayE (either Just (const Nothing))
 
 rightE :: Events (Either a b) -> Events b
-rightE e = Events (consumeE e . either (const (pure ActiveYes)))
-
--- iterateE :: (a -> a) -> a -> Events b -> Events a
--- iterateE = undefined
-
--- withIterateE :: (a -> a) -> a -> Events b -> Events (a, b)
--- withIterateE = undefined
+rightE = mapMayE (either (const Nothing) Just)
 
 sumE :: Num a => Events a -> Events a
 sumE = scanE (+) 0
@@ -285,26 +279,33 @@ appendE = scanE (flip (<>)) mempty
 foldMapE :: Monoid b => (a -> b) -> Events a -> Events b
 foldMapE f = scanE (flip (<>) . f) mempty
 
--- takeE :: Int -> Events a -> Events a
--- takeE = undefined
+takeE :: Int -> Events a -> Events a
+takeE n0 e = Events $ \cb -> do
+  nVar <- newTVarIO n0
+  consumeE e $ \a -> do
+    taking <- atomically (stateTVar nVar (\n -> if n > 0 then (True, n - 1) else (False, n)))
+    if taking then cb a else pure ActiveNo
 
--- dropE :: Int -> Events a -> Events a
--- dropE = undefined
+dropE :: Int -> Events a -> Events a
+dropE = accumMayE (\a n -> if n > 0 then (Nothing, n - 1) else (Just a, n))
 
--- takeWhileE :: (a -> Bool) -> Events a -> Events a
--- takeWhileE = undefined
+takeWhileE :: (a -> Bool) -> Events a -> Events a
+takeWhileE f e = Events (\cb -> consumeE e (\a -> if f a then cb a else pure ActiveNo))
 
--- dropWhileE :: (a -> Bool) -> Events a -> Events a
--- dropWhileE = undefined
+dropWhileE :: (a -> Bool) -> Events a -> Events a
+dropWhileE f = accumMayE (\a dropping -> if dropping && f a then (Nothing, dropping) else (Just a, False)) True
 
--- cycleE :: [a] -> Events b -> Events a
--- cycleE = undefined
-
--- seqAtE :: Seq a -> Events Int -> Events a
--- seqAtE = undefined
-
--- mapAtE :: Ord k => Map k v -> Events k -> Events v
--- mapAtE = undefined
+cycleE :: Foldable f => f a -> Events a
+cycleE fa = Events (\cb -> let as0 = toList fa in case as0 of [] -> pure (); _ -> go as0 as0 cb)
+ where
+  go as0 as cb =
+    case as of
+      [] -> go as0 as0 cb
+      a : as' -> do
+        active <- cb a
+        case active of
+          ActiveNo -> pure ()
+          ActiveYes -> go as0 as' cb
 
 data Hold a = Hold
   { holdStart :: !a
