@@ -27,7 +27,7 @@ source-repository head
 library
   exposed-modules:
       Tricksy.Active
-      Tricksy.Main
+      Tricksy.Internal
       Tricksy.Time
   other-modules:
       Paths_tricksy
@@ -62,62 +62,9 @@ library
   build-depends:
       async
     , base >=4.12 && <5
-    , brick
-    , bytestring
     , containers
     , deepseq
-    , mtl
     , stm
-    , text
-    , vector
-    , vty
-  default-language: GHC2021
-
-executable tricksy-exe
-  main-is: Main.hs
-  other-modules:
-      Paths_tricksy
-  hs-source-dirs:
-      exe
-  default-extensions:
-      BangPatterns
-      ConstraintKinds
-      DataKinds
-      DeriveFunctor
-      DeriveFoldable
-      DeriveGeneric
-      DeriveTraversable
-      DerivingStrategies
-      DerivingVia
-      FlexibleContexts
-      FlexibleInstances
-      FunctionalDependencies
-      GADTs
-      GeneralizedNewtypeDeriving
-      LambdaCase
-      KindSignatures
-      MultiParamTypeClasses
-      Rank2Types
-      ScopedTypeVariables
-      StandaloneDeriving
-      TupleSections
-      TypeApplications
-      TypeOperators
-      TypeFamilies
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints -fno-warn-unused-top-binds -threaded -rtsopts -with-rtsopts=-N
-  build-depends:
-      async
-    , base >=4.12 && <5
-    , brick
-    , bytestring
-    , containers
-    , deepseq
-    , mtl
-    , stm
-    , text
-    , tricksy
-    , vector
-    , vty
   default-language: GHC2021
 
 test-suite tricksy-test
@@ -156,16 +103,10 @@ test-suite tricksy-test
   build-depends:
       async
     , base >=4.12 && <5
-    , brick
-    , bytestring
     , containers
     , deepseq
-    , mtl
     , stm
     , tasty
     , tasty-hunit
-    , text
     , tricksy
-    , vector
-    , vty
   default-language: GHC2021

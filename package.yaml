@@ -18,13 +18,7 @@ extra-source-files:
 dependencies:
 - base >= 4.12 && < 5
 - deepseq
-- brick
-- vty
 - containers
-- text
-- bytestring
-- mtl
-- vector
 - async
 - stm
 
@@ -66,17 +60,6 @@ ghc-options:
 
 library:
   source-dirs: src
-
-executables:
-  tricksy-exe:
-    main: Main.hs
-    source-dirs: exe
-    ghc-options:
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
-    dependencies:
-    - tricksy
 
 tests:
   tricksy-test:

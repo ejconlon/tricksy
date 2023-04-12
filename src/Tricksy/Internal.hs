@@ -1,6 +1,5 @@
-module Tricksy.Main
-  ( main
-  , Events
+module Tricksy.Internal
+  ( Events
   , consumeE
   , parallelE
   , andThenE
@@ -33,9 +32,6 @@ import Data.Foldable (toList)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.Time (MonoTime, TimeDelta)
-
-main :: IO ()
-main = putStrLn "Hello, world!"
 
 -- | Event producer - takes a consumer callback and pushes events through.
 -- When the consumer callback signals not active, the producer should stop pushing.
