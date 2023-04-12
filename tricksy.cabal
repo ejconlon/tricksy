@@ -26,6 +26,7 @@ source-repository head
 
 library
   exposed-modules:
+      Tricksy.Active
       Tricksy.Main
       Tricksy.Time
   other-modules:

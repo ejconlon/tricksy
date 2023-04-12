@@ -31,56 +31,53 @@ import Control.Monad (void, when)
 import Data.Bifunctor (first)
 import Data.Foldable (toList)
 import System.IO.Error (isEOFError)
+import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.Time (MonoTime, TimeDelta)
 
 main :: IO ()
 main = putStrLn "Hello, world!"
 
--- | Signal from consumers to producers
-data Alive = AliveYes | AliveNo
-  deriving stock (Eq, Ord, Show, Enum, Bounded)
-
 -- | Event producer - takes a consumer callback and pushes events through.
--- When the consumer callback signals not alive, the producer should stop pushing.
-newtype Events a = Events {consumeE :: (a -> IO Alive) -> IO ()}
+-- When the consumer callback signals not active, the producer should stop pushing.
+newtype Events a = Events {consumeE :: (a -> IO Active) -> IO ()}
 
 instance Functor Events where
   fmap f e = Events (\cb -> consumeE e (cb . f))
 
 -- | Wrap a callback to check producer liveness before invoking callback and
 -- to update the var after invoking it.
-guardedCall :: TVar Alive -> (a -> IO Alive) -> a -> IO Alive
-guardedCall aliveVar cb a = do
-  alive <- readTVarIO aliveVar
-  case alive of
-    AliveNo -> pure AliveNo
-    AliveYes -> do
-      stillAlive <- cb a
-      case stillAlive of
-        AliveNo -> atomically (writeTVar aliveVar AliveNo)
-        AliveYes -> pure ()
-      pure stillAlive
+guardedCall :: ActiveVar -> (a -> IO Active) -> a -> IO Active
+guardedCall activeVar cb a = do
+  active <- readActiveVarIO activeVar
+  case active of
+    ActiveNo -> pure ActiveNo
+    ActiveYes -> do
+      stillActive <- cb a
+      case stillActive of
+        ActiveNo -> deactivateVarIO activeVar
+        ActiveYes -> pure ()
+      pure stillActive
 
 -- | Consume while checking producer liveness.
-guardedConsume :: TVar Alive -> Events a -> (a -> IO Alive) -> IO ()
-guardedConsume aliveVar e cb = consumeE e (guardedCall aliveVar cb)
+guardedConsume :: ActiveVar -> Events a -> (a -> IO Active) -> IO ()
+guardedConsume activeVar e cb = consumeE e (guardedCall activeVar cb)
 
 -- | Consume async with thread killed when producer dies.
-guardedAsyncConsume :: TVar Alive -> Events a -> (a -> IO Alive) -> IO ()
-guardedAsyncConsume aliveVar e cb = do
-  withAsync (guardedConsume aliveVar e cb) $ \async -> do
+guardedAsyncConsume :: ActiveVar -> Events a -> (a -> IO Active) -> IO ()
+guardedAsyncConsume activeVar e cb = do
+  withAsync (guardedConsume activeVar e cb) $ \async -> do
     (shouldCancel, merr) <- atomically $ do
       mres <- pollSTM async
       case mres of
         Nothing -> do
-          alive <- readTVar aliveVar
-          case alive of
-            AliveYes -> retry
-            AliveNo -> pure (True, Nothing)
+          active <- readActiveVar activeVar
+          case active of
+            ActiveYes -> retry
+            ActiveNo -> pure (True, Nothing)
         Just res -> do
           case res of
             Left err -> do
-              writeTVar aliveVar AliveNo
+              deactivateVar activeVar
               pure (False, Just err)
             Right _ -> pure (False, Nothing)
     let cleanup = when shouldCancel (cancel async)
@@ -105,60 +102,60 @@ writeApRight apVar a = stateTVar apVar $ \(Ap mf _) ->
         Nothing -> (Nothing, ap')
         Just f -> (Just (f a), ap')
 
-callAp :: TVar (Ap a b) -> (TVar (Ap a b) -> x -> STM (Maybe b)) -> (b -> IO Alive) -> x -> IO Alive
+callAp :: TVar (Ap a b) -> (TVar (Ap a b) -> x -> STM (Maybe b)) -> (b -> IO Active) -> x -> IO Active
 callAp apVar write cb x = do
   mb <- atomically (write apVar x)
   case mb of
-    Nothing -> pure AliveYes
+    Nothing -> pure ActiveYes
     Just b -> cb b
 
 instance Applicative Events where
   pure a = Events (\cb -> void (cb a))
   el <*> er = Events $ \cb -> do
-    aliveVar <- newTVarIO AliveYes
+    activeVar <- newActiveVarIO
     apVar <- newTVarIO (Ap Nothing Nothing)
     let cbl = callAp apVar writeApLeft cb
         cbr = callAp apVar writeApRight cb
-    concurrently_ (guardedAsyncConsume aliveVar el cbl) (guardedAsyncConsume aliveVar er cbr)
+    concurrently_ (guardedAsyncConsume activeVar el cbl) (guardedAsyncConsume activeVar er cbr)
 
 instance Alternative Events where
   empty = Events (const (pure ()))
   el <|> er = Events $ \cb -> do
-    aliveVar <- newTVarIO AliveYes
-    concurrently_ (guardedAsyncConsume aliveVar el cb) (guardedAsyncConsume aliveVar er cb)
+    activeVar <- newActiveVarIO
+    concurrently_ (guardedAsyncConsume activeVar el cb) (guardedAsyncConsume activeVar er cb)
 
 parallelE :: Foldable f => f (Events x) -> Events x
 parallelE es = Events $ \cb -> do
-  aliveVar <- newTVarIO AliveYes
-  mapConcurrently_ (\e -> guardedAsyncConsume aliveVar e cb) es
+  activeVar <- newActiveVarIO
+  mapConcurrently_ (\e -> guardedAsyncConsume activeVar e cb) es
 
 andThenE :: Events x -> Events x -> Events x
 andThenE e1 e2 = Events $ \cb -> do
-  aliveVar <- newTVarIO AliveYes
-  consumeE e1 (guardedCall aliveVar cb)
-  stillAlive <- readTVarIO aliveVar
-  case stillAlive of
-    AliveNo -> pure ()
-    AliveYes -> consumeE e2 cb
+  activeVar <- newActiveVarIO
+  consumeE e1 (guardedCall activeVar cb)
+  stillActive <- readActiveVarIO activeVar
+  case stillActive of
+    ActiveNo -> pure ()
+    ActiveYes -> consumeE e2 cb
 
 sequentialE :: Foldable f => f (Events x) -> Events x
 sequentialE es = res
  where
   res = Events $ \cb -> do
-    aliveVar <- newTVarIO AliveYes
-    let cbg = guardedCall aliveVar cb
+    activeVar <- newActiveVarIO
+    let cbg = guardedCall activeVar cb
     case toList es of
       [] -> pure ()
-      z : zs -> go aliveVar z zs cbg
-  go aliveVar z zs cbg = do
+      z : zs -> go activeVar z zs cbg
+  go activeVar z zs cbg = do
     consumeE z cbg
-    stillAlive <- readTVarIO aliveVar
-    case stillAlive of
-      AliveNo -> pure ()
-      AliveYes ->
+    stillActive <- readActiveVarIO activeVar
+    case stillActive of
+      ActiveNo -> pure ()
+      ActiveYes ->
         case zs of
           [] -> pure ()
-          z' : zs' -> go aliveVar z' zs' cbg
+          z' : zs' -> go activeVar z' zs' cbg
 
 instance Monad Events where
   return = pure
@@ -172,10 +169,10 @@ repeatE act = Events go
  where
   go cb = do
     a <- act
-    alive <- cb a
-    case alive of
-      AliveNo -> pure ()
-      AliveYes -> go cb
+    active <- cb a
+    case active of
+      ActiveNo -> pure ()
+      ActiveYes -> go cb
 
 eachE :: Foldable f => f a -> Events a
 eachE fa = Events (go (toList fa))
@@ -184,12 +181,12 @@ eachE fa = Events (go (toList fa))
     case as of
       [] -> pure ()
       a : as' -> do
-        alive <- cb a
-        case alive of
-          AliveNo -> pure ()
-          AliveYes -> go as' cb
+        active <- cb a
+        case active of
+          ActiveNo -> pure ()
+          ActiveYes -> go as' cb
 
-callZipWith :: (a -> b -> c) -> TMVar a -> TMVar b -> (c -> IO Alive) -> a -> IO Alive
+callZipWith :: (a -> b -> c) -> TMVar a -> TMVar b -> (c -> IO Active) -> a -> IO Active
 callZipWith f aVar bVar cb a = do
   mc <- atomically $ do
     putTMVar aVar a
@@ -201,17 +198,17 @@ callZipWith f aVar bVar cb a = do
         _ <- takeTMVar aVar
         pure (Just (f a b))
   case mc of
-    Nothing -> pure AliveYes
+    Nothing -> pure ActiveYes
     Just c -> cb c
 
 zipWithE :: (a -> b -> c) -> Events a -> Events b -> Events c
 zipWithE f ea eb = Events $ \cb -> do
-  aliveVar <- newTVarIO AliveYes
+  activeVar <- newActiveVarIO
   aVar <- newEmptyTMVarIO
   bVar <- newEmptyTMVarIO
   let cba = callZipWith f aVar bVar cb
       cbb = callZipWith (flip f) bVar aVar cb
-  concurrently_ (guardedAsyncConsume aliveVar ea cba) (guardedAsyncConsume aliveVar eb cbb)
+  concurrently_ (guardedAsyncConsume activeVar ea cba) (guardedAsyncConsume activeVar eb cbb)
 
 zipE :: Events a -> Events b -> Events (a, b)
 zipE = zipWithE (,)
@@ -224,13 +221,13 @@ unfoldE f s0 = Events (\cb -> newTVarIO s0 >>= go cb)
     case ma of
       Nothing -> pure ()
       Just a -> do
-        alive <- cb a
-        case alive of
-          AliveNo -> pure ()
-          AliveYes -> go cb sVar
+        active <- cb a
+        case active of
+          ActiveNo -> pure ()
+          ActiveYes -> go cb sVar
 
 mapMayE :: (a -> Maybe b) -> Events a -> Events b
-mapMayE f e = Events (\cb -> consumeE e (maybe (pure AliveYes) cb . f))
+mapMayE f e = Events (\cb -> consumeE e (maybe (pure ActiveYes) cb . f))
 
 scanE :: (a -> b -> b) -> b -> Events a -> Events b
 scanE f b0 e = Events $ \cb -> do
@@ -242,7 +239,7 @@ scanMayE f b0 e = Events $ \cb -> do
   bVar <- newTVarIO b0
   consumeE e $ \a -> do
     mb <- atomically (stateTVar bVar (\b -> maybe (Nothing, b) (\b' -> (Just b', b')) (f a b)))
-    maybe (pure AliveYes) cb mb
+    maybe (pure ActiveYes) cb mb
 
 accumE :: (a -> s -> (b, s)) -> s -> Events a -> Events b
 accumE f s0 e = Events $ \cb -> do
@@ -254,19 +251,19 @@ accumMayE f s0 e = Events $ \cb -> do
   sVar <- newTVarIO s0
   consumeE e $ \a -> do
     mb <- atomically (stateTVar sVar (\s -> maybe (Nothing, s) (first Just) (f a s)))
-    maybe (pure AliveYes) cb mb
+    maybe (pure ActiveYes) cb mb
 
 filterE :: (a -> Bool) -> Events a -> Events a
-filterE f e = Events (\cb -> consumeE e (\a -> if f a then cb a else pure AliveYes))
+filterE f e = Events (\cb -> consumeE e (\a -> if f a then cb a else pure ActiveYes))
 
 filterJustE :: Events (Maybe a) -> Events a
-filterJustE e = Events (consumeE e . maybe (pure AliveYes))
+filterJustE e = Events (consumeE e . maybe (pure ActiveYes))
 
 leftE :: Events (Either a b) -> Events a
-leftE e = Events (\cb -> consumeE e (either cb (const (pure AliveYes))))
+leftE e = Events (\cb -> consumeE e (either cb (const (pure ActiveYes))))
 
 rightE :: Events (Either a b) -> Events b
-rightE e = Events (consumeE e . either (const (pure AliveYes)))
+rightE e = Events (consumeE e . either (const (pure ActiveYes)))
 
 -- iterateE :: (a -> a) -> a -> Events b -> Events a
 -- iterateE = undefined
@@ -332,19 +329,16 @@ instance Applicative Behavior where
 holdB :: IO (Hold a) -> Behavior a
 holdB = BehaviorHold
 
-consumeHold :: a -> Events a -> (a -> IO Alive) -> IO ()
-consumeHold start e cb = do
-  alive <- cb start
-  case alive of
-    AliveNo -> pure ()
-    AliveYes -> consumeE e cb
-
 edgeE :: Behavior a -> Events a
 edgeE = \case
   BehaviorPure a -> pure a
   BehaviorHold mh -> Events $ \cb -> mask $ \restore -> do
     Hold start e mrel <- mh
-    let go = restore (consumeHold start e cb)
+    let go = restore $ do
+          active <- cb start
+          case active of
+            ActiveNo -> pure ()
+            ActiveYes -> consumeE e cb
     maybe go (finally go) mrel
 
 data HoldRef a = HoldRef
@@ -356,22 +350,27 @@ data Ref a
   = RefPure !a
   | RefHold !(HoldRef a)
 
-refB :: Behavior a -> IO (Ref a)
-refB = res
+observeB :: Behavior a -> IO (Ref a)
+observeB = res
  where
   res = \case
     BehaviorPure a -> pure (RefPure a)
     BehaviorHold mh -> mask $ \restore -> do
       Hold start e mrel <- mh
       curVar <- newTVarIO start
-      let bgInner = restore (consumeE e (\a -> AliveYes <$ atomically (writeTVar curVar a)))
+      let bgInner = restore (consumeE e (\a -> ActiveYes <$ atomically (writeTVar curVar a)))
           bgOuter = maybe bgInner (finally bgInner) mrel
       withAsync bgOuter (pure . RefHold . HoldRef curVar)
 
-observeR :: Ref a -> STM a
-observeR = \case
+readR :: Ref a -> STM a
+readR = \case
   RefPure a -> pure a
   RefHold (HoldRef curVar _) -> readTVar curVar
+
+peekR :: Ref a -> IO a
+peekR = \case
+  RefPure a -> pure a
+  RefHold (HoldRef curVar _) -> readTVarIO curVar
 
 disposeR :: Ref a -> IO ()
 disposeR = \case
@@ -390,26 +389,26 @@ tickE = undefined
 timerE :: TimeDelta -> Events TimeDelta
 timerE = undefined
 
--- periodic :: TimeDelta -> IO Alive -> IO ()
+-- periodic :: TimeDelta -> IO Active -> IO ()
 -- periodic delta act = undefined
 
 -- | Events from a (closable) channel
-channelE :: TVar Alive -> TChan a -> Events a
-channelE aliveVar chanVar = Events go
+channelE :: ActiveVar -> TChan a -> Events a
+channelE activeVar chanVar = Events go
  where
   go cb = do
     ma <- atomically $ do
-      alive <- readTVar aliveVar
-      case alive of
-        AliveNo -> pure Nothing
-        AliveYes -> fmap Just (readTChan chanVar)
+      active <- readActiveVar activeVar
+      case active of
+        ActiveNo -> pure Nothing
+        ActiveYes -> fmap Just (readTChan chanVar)
     case ma of
       Nothing -> pure ()
       Just a -> do
-        alive <- cb a
-        case alive of
-          AliveNo -> atomically (writeTVar aliveVar AliveNo)
-          AliveYes -> go cb
+        active <- cb a
+        case active of
+          ActiveNo -> deactivateVarIO activeVar
+          ActiveYes -> go cb
 
 -- | Reads to EOF
 stdinE :: Events String
@@ -420,7 +419,7 @@ stdinE = Events go
     case ms of
       Nothing -> pure ()
       Just s -> do
-        alive <- cb s
-        case alive of
-          AliveNo -> pure ()
-          AliveYes -> go cb
+        active <- cb s
+        case active of
+          ActiveNo -> pure ()
+          ActiveYes -> go cb
