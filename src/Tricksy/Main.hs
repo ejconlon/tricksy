@@ -6,14 +6,17 @@ where
 import Control.Applicative (Alternative (..))
 import Control.Concurrent (ThreadId, forkFinally, killThread)
 import Control.Concurrent.Async (concurrently_, mapConcurrently_)
-import Control.Concurrent.STM (STM, atomically, retry)
+import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, readTChan)
+import Control.Concurrent.STM.TMVar (TMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
-import Control.Exception (catchJust, finally)
+import Control.Exception (catchJust, finally, onException)
 import Control.Monad (ap, void, when)
 import Data.Bifunctor (first)
+import Data.Foldable (toList)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
+import Data.Tuple (swap)
 import System.IO.Error (isEOFError)
 import Tricksy.Time (MonoTime, TimeDelta, currentMonoTime)
 
@@ -23,10 +26,10 @@ main = putStrLn "Hello, world!"
 data Alive = AliveYes | AliveNo
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
-newtype Stream a = Stream {unStream :: (a -> IO Alive) -> IO ()}
+newtype Events a = Events {consume :: (a -> IO Alive) -> IO ()}
 
-instance Functor Stream where
-  fmap f (Stream x) = Stream (\cb -> x (cb . f))
+instance Functor Events where
+  fmap f e = Events (\cb -> consume e (cb . f))
 
 data Ap a b = Ap
   { apLeft :: !(Maybe (a -> b))
@@ -61,55 +64,91 @@ callAp aliveVar apVar cb write x = do
     ApStateEmit b -> do
       stillAlive <- cb b
       case stillAlive of
-        AliveNo -> atomically (writeTVar aliveVar stillAlive)
+        AliveNo -> atomically (writeTVar aliveVar AliveNo)
         AliveYes -> pure ()
       pure stillAlive
     ApStateHalt -> pure AliveNo
 
-instance Applicative Stream where
-  pure a = Stream (\cb -> void (cb a))
-  Stream xf <*> Stream xa = Stream $ \cb -> do
+instance Applicative Events where
+  pure a = Events (\cb -> void (cb a))
+  el <*> er = Events $ \cb -> do
     aliveVar <- newTVarIO AliveYes
     apVar <- newTVarIO (Ap Nothing Nothing)
     let cbl = callAp aliveVar apVar cb writeApLeft
         cbr = callAp aliveVar apVar cb writeApRight
-    concurrently_ (xf cbl) (xa cbr)
+    concurrently_ (consume el cbl) (consume er cbr)
 
 callAlt :: TVar Alive -> (b -> IO Alive) -> b -> IO Alive
 callAlt aliveVar cb b = do
   alive <- readTVarIO aliveVar
   case alive of
-    AliveNo -> pure alive
+    AliveNo -> pure AliveNo
     AliveYes -> do
       stillAlive <- cb b
       case stillAlive of
-        AliveNo -> atomically (writeTVar aliveVar stillAlive)
+        AliveNo -> atomically (writeTVar aliveVar AliveNo)
         AliveYes -> pure ()
       pure stillAlive
 
-instance Alternative Stream where
-  empty = Stream (const (pure ()))
-  Stream x1 <|> Stream x2 = Stream $ \cb -> do
+instance Alternative Events where
+  empty = Events (const (pure ()))
+  el <|> er = Events $ \cb -> do
     aliveVar <- newTVarIO AliveYes
     let cb' = callAlt aliveVar cb
-    concurrently_ (x1 cb') (x2 cb')
+    concurrently_ (consume el cb') (consume er cb')
 
-parallel :: Foldable f => f (Stream x) -> Stream x
-parallel ss = Stream $ \cb -> do
+parallel :: Foldable f => f (Events x) -> Events x
+parallel es = Events $ \cb -> do
   aliveVar <- newTVarIO AliveYes
   let cb' = callAlt aliveVar cb
-  mapConcurrently_ (\(Stream x) -> x cb') ss
+  mapConcurrently_ (`consume` cb') es
 
-instance Monad Stream where
+callAndThen :: TVar Alive -> (b -> IO Alive) -> b -> IO Alive
+callAndThen aliveVar cb b = do
+  stillAlive <- cb b
+  case stillAlive of
+    AliveNo -> atomically (writeTVar aliveVar AliveNo)
+    AliveYes -> pure ()
+  pure stillAlive
+
+andThen :: Events x -> Events x -> Events x
+andThen e1 e2 = Events $ \cb -> do
+  aliveVar <- newTVarIO AliveYes
+  consume e1 (callAndThen aliveVar cb)
+  stillAlive <- readTVarIO aliveVar
+  case stillAlive of
+    AliveNo -> pure ()
+    AliveYes -> consume e2 cb
+
+sequential :: Foldable f => f (Events x) -> Events x
+sequential es = res
+ where
+  res = Events $ \cb -> do
+    aliveVar <- newTVarIO AliveYes
+    let cb' = callAndThen aliveVar cb
+    case toList es of
+      [] -> pure ()
+      z : zs -> go aliveVar z zs cb'
+  go aliveVar z zs cb' = do
+    consume z cb'
+    stillAlive <- readTVarIO aliveVar
+    case stillAlive of
+      AliveNo -> pure ()
+      AliveYes ->
+        case zs of
+          [] -> pure ()
+          z' : zs' -> go aliveVar z' zs' cb'
+
+instance Monad Events where
   return = pure
-  Stream xa >>= f = Stream $ \cb -> do
+  ea >>= f = Events $ \cb -> do
     undefined
 
-once :: IO a -> Stream a
-once act = Stream (\cb -> void (act >>= cb))
+once :: IO a -> Events a
+once act = Events (\cb -> void (act >>= cb))
 
-repeatedly :: IO a -> Stream a
-repeatedly act = Stream go
+repeatedly :: IO a -> Events a
+repeatedly act = Events go
  where
   go cb = do
     a <- act
@@ -118,118 +157,140 @@ repeatedly act = Stream go
       AliveNo -> pure ()
       AliveYes -> go cb
 
-scan :: (a -> b -> b) -> b -> Stream a -> Stream b
-scan f b0 (Stream xa) = Stream $ \cb -> do
-  bVar <- newTVarIO b0
-  xa (\a -> atomically (stateTVar bVar (\b -> let b' = f a b in (b', b'))) >>= cb)
+each :: Foldable f => f a -> Events a
+each fa = Events (go (toList fa))
+ where
+  go as cb =
+    case as of
+      [] -> pure ()
+      a : as' -> do
+        alive <- cb a
+        case alive of
+          AliveNo -> pure ()
+          AliveYes -> go as' cb
 
-scanMay :: (a -> b -> Maybe b) -> b -> Stream a -> Stream b
-scanMay f b0 (Stream xa) = Stream $ \cb -> do
+zippedWith :: (a -> b -> c) -> Events a -> Events b -> Events c
+zippedWith f ea eb = Events $ \cb -> do
+  aliveVar <- newTVarIO AliveYes
+  aVar <- newEmptyTMVarIO
+  bVar <- newEmptyTMVarIO
+  let cba = callZippedWith f aliveVar aVar bVar cb
+      cbb = callZippedWith (flip f) aliveVar bVar aVar cb
+  concurrently_ (consume ea cba) (consume eb cbb)
+
+callZippedWith :: (a -> b -> c) -> TVar Alive -> TMVar a -> TMVar b -> (c -> IO Alive) -> a -> IO Alive
+callZippedWith f aliveVar aVar bVar cb = _
+
+scanE :: (a -> b -> b) -> b -> Events a -> Events b
+scanE f b0 e = Events $ \cb -> do
   bVar <- newTVarIO b0
-  xa $ \a -> do
+  consume e (\a -> atomically (stateTVar bVar (\b -> let b' = f a b in (b', b'))) >>= cb)
+
+scanMayE :: (a -> b -> Maybe b) -> b -> Events a -> Events b
+scanMayE f b0 e = Events $ \cb -> do
+  bVar <- newTVarIO b0
+  consume e $ \a -> do
     mb <- atomically (stateTVar bVar (\b -> maybe (Nothing, b) (\b' -> (Just b', b')) (f a b)))
     maybe (pure AliveYes) cb mb
 
-mapMay :: (a -> Maybe b) -> Stream a -> Stream b
-mapMay f (Stream xa) = Stream (\cb -> xa (maybe (pure AliveYes) cb . f))
+mapMayE :: (a -> Maybe b) -> Events a -> Events b
+mapMayE f e = Events (\cb -> consume e (maybe (pure AliveYes) cb . f))
 
-accum :: (a -> s -> (b, s)) -> s -> Stream a -> Stream b
-accum f s0 (Stream xa) = Stream $ \cb -> do
+accumE :: (a -> s -> (b, s)) -> s -> Events a -> Events b
+accumE f s0 e = Events $ \cb -> do
   sVar <- newTVarIO s0
-  xa (\a -> atomically (stateTVar sVar (f a)) >>= cb)
+  consume e (\a -> atomically (stateTVar sVar (f a)) >>= cb)
 
-accumMay :: (a -> s -> Maybe (b, s)) -> s -> Stream a -> Stream b
-accumMay f s0 (Stream xa) = Stream $ \cb -> do
+accumMayE :: (a -> s -> Maybe (b, s)) -> s -> Events a -> Events b
+accumMayE f s0 e = Events $ \cb -> do
   sVar <- newTVarIO s0
-  xa $ \a -> do
+  consume e $ \a -> do
     mb <- atomically (stateTVar sVar (\s -> maybe (Nothing, s) (first Just) (f a s)))
     maybe (pure AliveYes) cb mb
 
-filters :: (a -> Bool) -> Stream a -> Stream a
-filters f (Stream xa) = Stream (\cb -> xa (\a -> if f a then cb a else pure AliveYes))
+filterE :: (a -> Bool) -> Events a -> Events a
+filterE f e = Events (\cb -> consume e (\a -> if f a then cb a else pure AliveYes))
 
-filterJust :: Stream (Maybe a) -> Stream a
-filterJust (Stream xma) = Stream (xma . maybe (pure AliveYes))
+filterJustE :: Events (Maybe a) -> Events a
+filterJustE e = Events (consume e . maybe (pure AliveYes))
 
-splits :: Stream (Either a b) -> (Stream a, Stream b)
-splits s = (lefts s, rights s)
+leftE :: Events (Either a b) -> Events a
+leftE e = Events (\cb -> consume e (either cb (const (pure AliveYes))))
 
-lefts :: Stream (Either a b) -> Stream a
-lefts (Stream xeab) = Stream (\cb -> xeab (either cb (const (pure AliveYes))))
+rightE :: Events (Either a b) -> Events b
+rightE e = Events (consume e . either (const (pure AliveYes)))
 
-rights :: Stream (Either a b) -> Stream b
-rights (Stream xeab) = Stream (xeab . either (const (pure AliveYes)))
+-- iterateE :: (a -> a) -> a -> Events b -> Events a
+-- iterateE = undefined
 
-iterates :: (a -> a) -> a -> Stream b -> Stream a
-iterates = undefined
+-- withIterateE :: (a -> a) -> a -> Events b -> Events (a, b)
+-- withIterateE = undefined
 
-withIterates :: (a -> a) -> a -> Stream b -> Stream (a, b)
-withIterates = undefined
+sumE :: Num a => Events a -> Events a
+sumE = scanE (+) 0
 
-sums :: Num a => Stream a -> Stream a
-sums = scan (+) 0
+productE :: Num a => Events a -> Events a
+productE = scanE (*) 1
 
-products :: Num a => Stream a -> Stream a
-products = scan (*) 1
+countE :: Events a -> Events Int
+countE = scanE (const (+ 1)) 0
 
-count :: Stream a -> Stream Int
-count = scan (const (+ 1)) 0
+-- withCountE :: Events a -> Events (Int, a)
+-- withCountE = undefined
 
-withCount :: Stream a -> Stream (Int, a)
-withCount = undefined
+appendE :: Monoid a => Events a -> Events a
+appendE = scanE (flip (<>)) mempty
 
-appends :: Monoid a => Stream a -> Stream a
-appends = scan (flip (<>)) mempty
+foldMapE :: Monoid b => (a -> b) -> Events a -> Events b
+foldMapE f = scanE (flip (<>) . f) mempty
 
-foldMaps :: Monoid b => (a -> b) -> Stream a -> Stream b
-foldMaps f = scan (flip (<>) . f) mempty
+-- takeE :: Int -> Events a -> Events a
+-- takeE = undefined
 
-takes :: Int -> Stream a -> Stream a
-takes = undefined
+-- dropE :: Int -> Events a -> Events a
+-- dropE = undefined
 
-drops :: Int -> Stream a -> Stream a
-drops = undefined
+-- takeWhileE :: (a -> Bool) -> Events a -> Events a
+-- takeWhileE = undefined
 
-takesWhile :: (a -> Bool) -> Stream a -> Stream a
-takesWhile = undefined
+-- dropWhileE :: (a -> Bool) -> Events a -> Events a
+-- dropWhileE = undefined
 
-dropsWhile :: (a -> Bool) -> Stream a -> Stream a
-dropsWhile = undefined
+-- cycleE :: [a] -> Events b -> Events a
+-- cycleE = undefined
 
-cycles :: [a] -> Stream b -> Stream a
-cycles = undefined
+-- seqAtE :: Seq a -> Events Int -> Events a
+-- seqAtE = undefined
 
-seqAt :: Seq a -> Stream Int -> Stream a
-seqAt = undefined
-
-mapAt :: Ord k => Map k v -> Stream k -> Stream v
-mapAt = undefined
+-- mapAtE :: Ord k => Map k v -> Events k -> Events v
+-- mapAtE = undefined
 
 data Hold a = Hold
   { holdStart :: !a
-  , holdStream :: !(Stream a)
+  , holdEvents :: !(Events a)
   , holdRelease :: !(Maybe (IO ()))
   }
   deriving stock (Functor)
 
-data Signal a
-  = SignalPure !a
-  | SignalHold !(Hold a)
+data Behavior a
+  = BehaviorPure !a
+  | BehaviorHold !(IO (Hold a))
   deriving stock (Functor)
 
-instance Applicative Signal where
-  pure = SignalPure
+instance Applicative Behavior where
+  pure = BehaviorPure
   (<*>) = undefined
 
-hold :: a -> Stream a -> Maybe (IO ()) -> Signal a
-hold start stream mrelease = SignalHold (Hold start stream mrelease)
+holdB :: IO (Hold a) -> Behavior a
+holdB = BehaviorHold
 
-unHold :: Signal a -> Stream a
-unHold = \case
-  SignalPure a -> pure a
-  SignalHold (Hold start (Stream xa) mrelease) -> Stream $ \cb ->
-    let go = cb start >>= \case AliveNo -> pure (); AliveYes -> xa cb
-    in  maybe go (finally go) mrelease
+edgeE :: Behavior a -> Events a
+edgeE = \case
+  BehaviorPure a -> pure a
+  BehaviorHold mh -> Events $ \cb -> do
+    Hold start e mrel <- mh
+    let go = cb start >>= \case AliveNo -> pure (); AliveYes -> consume e cb
+    maybe go (finally go) mrel
 
 data HoldRef a = HoldRef
   { hrAliveVar :: !(TVar Alive)
@@ -250,52 +311,58 @@ guardedWrite aliveVar curVar val = atomically $ do
   pure alive
 
 guardedRelease :: TVar Alive -> Maybe (IO ()) -> IO ()
-guardedRelease aliveVar mrelease =
-  case mrelease of
+guardedRelease aliveVar mrel =
+  case mrel of
     Nothing -> atomically (writeTVar aliveVar AliveNo)
-    Just release -> do
+    Just rel -> do
       cleanup <- atomically $ stateTVar aliveVar $ \alive ->
         case alive of
           AliveYes -> (True, AliveNo)
           AliveNo -> (False, alive)
-      when cleanup release
+      when cleanup rel
 
-ref :: Signal a -> IO (Ref a)
-ref = \case
-  SignalPure a -> pure (RefPure a)
-  SignalHold (Hold start (Stream ex) mrelease) -> do
-    aliveVar <- newTVarIO AliveYes
+refB :: Behavior a -> IO (Ref a)
+refB = res
+ where
+  res = \case
+    BehaviorPure a -> pure (RefPure a)
+    BehaviorHold mh -> do
+      aliveVar <- newTVarIO AliveYes
+      -- TODO need to mask to ensure release always happens
+      Hold start e mrel <- mh
+      goHold aliveVar start e mrel
+  goHold aliveVar start e mrel = do
     curVar <- newTVarIO start
-    tid <- forkFinally (ex (guardedWrite aliveVar curVar)) (const (guardedRelease aliveVar mrelease))
+    tid <- forkFinally (consume e (guardedWrite aliveVar curVar)) (const (guardedRelease aliveVar mrel))
     pure (RefHold (HoldRef aliveVar curVar tid))
 
-observe :: Ref a -> STM a
-observe = \case
+observeR :: Ref a -> STM a
+observeR = \case
   RefPure a -> pure a
   RefHold (HoldRef _ curVar _) -> readTVar curVar
 
-dispose :: Ref a -> IO ()
-dispose = \case
+disposeR :: Ref a -> IO ()
+disposeR = \case
   RefPure _ -> pure ()
   RefHold (HoldRef _ _ tid) -> killThread tid
 
-clock :: TimeDelta -> Stream MonoTime
-clock = undefined
+clockE :: TimeDelta -> Events MonoTime
+clockE = undefined
 
-pulse :: TimeDelta -> Stream ()
-pulse = undefined
+pulseE :: TimeDelta -> Events ()
+pulseE = undefined
 
-ticks :: TimeDelta -> Stream TimeDelta
-ticks = undefined
+tickE :: TimeDelta -> Events TimeDelta
+tickE = undefined
 
-timer :: TimeDelta -> Stream TimeDelta
-timer = undefined
+timerE :: TimeDelta -> Events TimeDelta
+timerE = undefined
 
-periodic :: TimeDelta -> IO Alive -> IO ()
-periodic delta act = undefined
+-- periodic :: TimeDelta -> IO Alive -> IO ()
+-- periodic delta act = undefined
 
-channel :: TVar Alive -> TChan a -> Stream a
-channel aliveVar chanVar = Stream go
+channelE :: TVar Alive -> TChan a -> Events a
+channelE aliveVar chanVar = Events go
  where
   go cb = do
     ma <- atomically $ do
@@ -312,8 +379,8 @@ channel aliveVar chanVar = Stream go
           AliveYes -> go cb
 
 -- | Reads to EOF
-stdin :: Stream String
-stdin = Stream go
+stdinE :: Events String
+stdinE = Events go
  where
   go cb = do
     ms <- catchJust (\e -> if isEOFError e then Just () else Nothing) (fmap Just getLine) (const (pure Nothing))
