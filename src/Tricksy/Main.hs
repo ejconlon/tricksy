@@ -2,19 +2,20 @@ module Tricksy.Main
   ( main
   )
 where
-import Data.Sequence (Seq)
-import Control.Concurrent.Async (mapConcurrently_, concurrently_)
-import Data.Map.Strict (Map)
-import Control.Concurrent.STM.TVar (TVar, writeTVar, newTVarIO, readTVar, stateTVar, readTVarIO)
-import Control.Concurrent (ThreadId, killThread, forkFinally)
-import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Monad (when, void, ap)
+
 import Control.Applicative (Alternative (..))
-import Control.Exception (finally, catchJust)
-import Tricksy.Time (TimeDelta, MonoTime, currentMonoTime)
+import Control.Concurrent (ThreadId, forkFinally, killThread)
+import Control.Concurrent.Async (concurrently_, mapConcurrently_)
+import Control.Concurrent.STM (STM, atomically, retry)
 import Control.Concurrent.STM.TChan (TChan, readTChan)
-import System.IO.Error (isEOFError)
+import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Exception (catchJust, finally)
+import Control.Monad (ap, void, when)
 import Data.Bifunctor (first)
+import Data.Map.Strict (Map)
+import Data.Sequence (Seq)
+import System.IO.Error (isEOFError)
+import Tricksy.Time (MonoTime, TimeDelta, currentMonoTime)
 
 main :: IO ()
 main = putStrLn "Hello, world!"
@@ -22,7 +23,7 @@ main = putStrLn "Hello, world!"
 data Alive = AliveYes | AliveNo
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
-newtype Stream a = Stream { unStream :: (a -> IO Alive) -> IO () }
+newtype Stream a = Stream {unStream :: (a -> IO Alive) -> IO ()}
 
 instance Functor Stream where
   fmap f (Stream x) = Stream (\cb -> x (cb . f))
@@ -35,16 +36,16 @@ data Ap a b = Ap
 writeApLeft :: TVar (Ap a b) -> (a -> b) -> STM (Maybe b)
 writeApLeft apVar f = stateTVar apVar $ \(Ap _ ma) ->
   let ap' = Ap (Just f) ma
-  in case ma of
-    Nothing -> (Nothing, ap')
-    Just a -> (Just (f a), ap')
+  in  case ma of
+        Nothing -> (Nothing, ap')
+        Just a -> (Just (f a), ap')
 
 writeApRight :: TVar (Ap a b) -> a -> STM (Maybe b)
 writeApRight apVar a = stateTVar apVar $ \(Ap mf _) ->
   let ap' = Ap mf (Just a)
-  in case mf of
-    Nothing -> (Nothing, ap')
-    Just f -> (Just (f a), ap')
+  in  case mf of
+        Nothing -> (Nothing, ap')
+        Just f -> (Just (f a), ap')
 
 data ApState b = ApStateContinue | ApStateEmit b | ApStateHalt
 
@@ -108,7 +109,8 @@ once :: IO a -> Stream a
 once act = Stream (\cb -> void (act >>= cb))
 
 repeatedly :: IO a -> Stream a
-repeatedly act = Stream go where
+repeatedly act = Stream go
+ where
   go cb = do
     a <- act
     alive <- cb a
@@ -136,26 +138,26 @@ accum f s0 (Stream xa) = Stream $ \cb -> do
   sVar <- newTVarIO s0
   xa (\a -> atomically (stateTVar sVar (f a)) >>= cb)
 
-accumMay ::  (a -> s -> Maybe (b, s)) -> s -> Stream a -> Stream b
+accumMay :: (a -> s -> Maybe (b, s)) -> s -> Stream a -> Stream b
 accumMay f s0 (Stream xa) = Stream $ \cb -> do
   sVar <- newTVarIO s0
   xa $ \a -> do
     mb <- atomically (stateTVar sVar (\s -> maybe (Nothing, s) (first Just) (f a s)))
     maybe (pure AliveYes) cb mb
 
-filters ::  (a -> Bool) -> Stream a -> Stream a
+filters :: (a -> Bool) -> Stream a -> Stream a
 filters f (Stream xa) = Stream (\cb -> xa (\a -> if f a then cb a else pure AliveYes))
 
-filterJust ::  Stream (Maybe a) -> Stream a
+filterJust :: Stream (Maybe a) -> Stream a
 filterJust (Stream xma) = Stream (xma . maybe (pure AliveYes))
 
-splits ::  Stream (Either a b) -> (Stream a, Stream b)
+splits :: Stream (Either a b) -> (Stream a, Stream b)
 splits s = (lefts s, rights s)
 
-lefts ::  Stream (Either a b) -> Stream a
+lefts :: Stream (Either a b) -> Stream a
 lefts (Stream xeab) = Stream (\cb -> xeab (either cb (const (pure AliveYes))))
 
-rights ::  Stream (Either a b) -> Stream b
+rights :: Stream (Either a b) -> Stream b
 rights (Stream xeab) = Stream (xeab . either (const (pure AliveYes)))
 
 iterates :: (a -> a) -> a -> Stream b -> Stream a
@@ -171,7 +173,7 @@ products :: Num a => Stream a -> Stream a
 products = scan (*) 1
 
 count :: Stream a -> Stream Int
-count = scan (const (+1)) 0
+count = scan (const (+ 1)) 0
 
 withCount :: Stream a -> Stream (Int, a)
 withCount = undefined
@@ -207,10 +209,11 @@ data Hold a = Hold
   { holdStart :: !a
   , holdStream :: !(Stream a)
   , holdRelease :: !(Maybe (IO ()))
-  } deriving stock (Functor)
+  }
+  deriving stock (Functor)
 
-data Signal a =
-    SignalPure !a
+data Signal a
+  = SignalPure !a
   | SignalHold !(Hold a)
   deriving stock (Functor)
 
@@ -225,8 +228,8 @@ unHold :: Signal a -> Stream a
 unHold = \case
   SignalPure a -> pure a
   SignalHold (Hold start (Stream xa) mrelease) -> Stream $ \cb ->
-    let go = cb start >>= \case { AliveNo -> pure (); AliveYes -> xa cb }
-    in maybe go (finally go) mrelease
+    let go = cb start >>= \case AliveNo -> pure (); AliveYes -> xa cb
+    in  maybe go (finally go) mrelease
 
 data HoldRef a = HoldRef
   { hrAliveVar :: !(TVar Alive)
@@ -234,8 +237,8 @@ data HoldRef a = HoldRef
   , hrTid :: !ThreadId
   }
 
-data Ref a =
-    RefPure !a
+data Ref a
+  = RefPure !a
   | RefHold !(HoldRef a)
 
 guardedWrite :: TVar Alive -> TVar a -> a -> IO Alive
@@ -292,7 +295,8 @@ periodic :: TimeDelta -> IO Alive -> IO ()
 periodic delta act = undefined
 
 channel :: TVar Alive -> TChan a -> Stream a
-channel aliveVar chanVar = Stream go where
+channel aliveVar chanVar = Stream go
+ where
   go cb = do
     ma <- atomically $ do
       alive <- readTVar aliveVar
@@ -309,7 +313,8 @@ channel aliveVar chanVar = Stream go where
 
 -- | Reads to EOF
 stdin :: Stream String
-stdin = Stream go where
+stdin = Stream go
+ where
   go cb = do
     ms <- catchJust (\e -> if isEOFError e then Just () else Nothing) (fmap Just getLine) (const (pure Nothing))
     case ms of
