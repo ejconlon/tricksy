@@ -332,23 +332,20 @@ instance Applicative Behavior where
 holdB :: IO (Hold a) -> Behavior a
 holdB = BehaviorHold
 
-consumeHold :: (a -> IO Alive) -> a -> Events a -> IO ()
-consumeHold cb start e = do
+consumeHold :: a -> Events a -> (a -> IO Alive) -> IO ()
+consumeHold start e cb = do
   alive <- cb start
   case alive of
     AliveNo -> pure ()
     AliveYes -> consumeE e cb
 
-guardHold :: IO (Hold a) -> (a -> Events a -> IO b) -> IO b
-guardHold mh f = mask $ \restore -> do
-  Hold start e mrel <- mh
-  let go = restore (f start e)
-  maybe go (finally go) mrel
-
 edgeE :: Behavior a -> Events a
 edgeE = \case
   BehaviorPure a -> pure a
-  BehaviorHold mh -> Events (guardHold mh . consumeHold)
+  BehaviorHold mh -> Events $ \cb -> mask $ \restore -> do
+    Hold start e mrel <- mh
+    let go = restore (consumeHold start e cb)
+    maybe go (finally go) mrel
 
 data HoldRef a = HoldRef
   { hrCurVar :: !(TVar a)
@@ -359,17 +356,17 @@ data Ref a
   = RefPure !a
   | RefHold !(HoldRef a)
 
-updateHold :: TVar a -> Events a -> IO ()
-updateHold curVar e = consumeE e (\a -> AliveYes <$ atomically (writeTVar curVar a))
-
 refB :: Behavior a -> IO (Ref a)
 refB = res
  where
   res = \case
     BehaviorPure a -> pure (RefPure a)
-    BehaviorHold mh -> guardHold mh $ \start e -> do
+    BehaviorHold mh -> mask $ \restore -> do
+      Hold start e mrel <- mh
       curVar <- newTVarIO start
-      withAsync (updateHold curVar e) (pure . RefHold . HoldRef curVar)
+      let bgInner = restore (consumeE e (\a -> AliveYes <$ atomically (writeTVar curVar a)))
+          bgOuter = maybe bgInner (finally bgInner) mrel
+      withAsync bgOuter (pure . RefHold . HoldRef curVar)
 
 observeR :: Ref a -> STM a
 observeR = \case
