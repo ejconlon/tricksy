@@ -8,7 +8,7 @@ import Control.Concurrent (ThreadId, forkFinally, killThread)
 import Control.Concurrent.Async (concurrently_, mapConcurrently_)
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, readTChan)
-import Control.Concurrent.STM.TMVar (TMVar)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally, onException)
 import Control.Monad (ap, void, when)
@@ -50,24 +50,24 @@ writeApRight apVar a = stateTVar apVar $ \(Ap mf _) ->
         Nothing -> (Nothing, ap')
         Just f -> (Just (f a), ap')
 
-data ApState b = ApStateContinue | ApStateEmit b | ApStateHalt
+data ParState b = ParStateHalt | ParStateContinue | ParStateEmit b
 
 callAp :: TVar Alive -> TVar (Ap a b) -> (b -> IO Alive) -> (TVar (Ap a b) -> x -> STM (Maybe b)) -> x -> IO Alive
 callAp aliveVar apVar cb write x = do
-  aps <- atomically $ do
+  ps <- atomically $ do
     alive <- readTVar aliveVar
     case alive of
-      AliveNo -> pure ApStateHalt
-      AliveYes -> fmap (maybe ApStateContinue ApStateEmit) (write apVar x)
-  case aps of
-    ApStateContinue -> pure AliveYes
-    ApStateEmit b -> do
+      AliveNo -> pure ParStateHalt
+      AliveYes -> fmap (maybe ParStateContinue ParStateEmit) (write apVar x)
+  case ps of
+    ParStateHalt -> pure AliveNo
+    ParStateContinue -> pure AliveYes
+    ParStateEmit b -> do
       stillAlive <- cb b
       case stillAlive of
         AliveNo -> atomically (writeTVar aliveVar AliveNo)
         AliveYes -> pure ()
       pure stillAlive
-    ApStateHalt -> pure AliveNo
 
 instance Applicative Events where
   pure a = Events (\cb -> void (cb a))
@@ -169,17 +169,42 @@ each fa = Events (go (toList fa))
           AliveNo -> pure ()
           AliveYes -> go as' cb
 
-zippedWith :: (a -> b -> c) -> Events a -> Events b -> Events c
-zippedWith f ea eb = Events $ \cb -> do
+zipE :: Events a -> Events b -> Events (a, b)
+zipE = zipWithE (,)
+
+zipWithE :: (a -> b -> c) -> Events a -> Events b -> Events c
+zipWithE f ea eb = Events $ \cb -> do
   aliveVar <- newTVarIO AliveYes
   aVar <- newEmptyTMVarIO
   bVar <- newEmptyTMVarIO
-  let cba = callZippedWith f aliveVar aVar bVar cb
-      cbb = callZippedWith (flip f) aliveVar bVar aVar cb
+  let cba = callZipWith f aliveVar aVar bVar cb
+      cbb = callZipWith (flip f) aliveVar bVar aVar cb
   concurrently_ (consume ea cba) (consume eb cbb)
 
-callZippedWith :: (a -> b -> c) -> TVar Alive -> TMVar a -> TMVar b -> (c -> IO Alive) -> a -> IO Alive
-callZippedWith f aliveVar aVar bVar cb = _
+callZipWith :: (a -> b -> c) -> TVar Alive -> TMVar a -> TMVar b -> (c -> IO Alive) -> a -> IO Alive
+callZipWith f aliveVar aVar bVar cb a = do
+  ps <- atomically $ do
+    alive <- readTVar aliveVar
+    case alive of
+      AliveNo -> pure ParStateHalt
+      AliveYes -> do
+        putTMVar aVar a
+        mb <- tryTakeTMVar bVar
+        case mb of
+          Nothing ->
+            pure ParStateContinue
+          Just b -> do
+            _ <- takeTMVar aVar
+            pure (ParStateEmit (f a b))
+  case ps of
+    ParStateHalt -> pure AliveNo
+    ParStateContinue -> pure AliveYes
+    ParStateEmit c -> do
+      stillAlive <- cb c
+      case stillAlive of
+        AliveNo -> atomically (writeTVar aliveVar AliveNo)
+        AliveYes -> pure ()
+      pure stillAlive
 
 scanE :: (a -> b -> b) -> b -> Events a -> Events b
 scanE f b0 e = Events $ \cb -> do
