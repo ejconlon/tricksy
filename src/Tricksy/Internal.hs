@@ -1,28 +1,9 @@
-module Tricksy.Internal
-  ( Events
-  , consumeE
-  , parallelE
-  , andThenE
-  , sequentialE
-  , liftE
-  , repeatE
-  , eachE
-  , zipWithE
-  , zipE
-  , unfoldE
-  , mapMayE
-  , scanE
-  , scanMayE
-  , accumE
-  , accumMayE
-  , filterE
-  )
-where
+module Tricksy.Internal where
 
 import Control.Applicative (Alternative (..))
 import Control.Concurrent.Async (Async, wait)
-import Control.Concurrent.STM (STM, atomically, isEmptyTMVar, newEmptyTMVarIO)
-import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, writeTChan)
+import Control.Concurrent.STM (STM, atomically, isEmptyTMVar, newEmptyTMVarIO, retry)
+import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, writeTChan, tryReadTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally, mask)
@@ -380,15 +361,19 @@ tickE = fmap snd . periodicE
 timerE :: TimeDelta -> Events TimeDelta
 timerE = appendE . tickE
 
-guardedProduce :: ActiveVar -> TChan a -> (a -> IO Active) -> IO ()
-guardedProduce activeVar c f = go
+produce :: ActiveVar -> TChan a -> (a -> IO Active) -> IO ()
+produce activeVar c f = go
  where
   go = do
     ma <- atomically $ do
-      active <- readActiveVar activeVar
-      case active of
-        ActiveNo -> pure Nothing
-        ActiveYes -> fmap Just (readTChan c)
+      ma <- tryReadTChan c
+      case ma of
+        Just _ -> pure ma
+        Nothing -> do
+          active <- readActiveVar activeVar
+          case active of
+            ActiveNo -> pure Nothing
+            ActiveYes -> retry
     case ma of
       Nothing -> pure ()
       Just a -> do
@@ -403,7 +388,7 @@ effectE f e =
     c <- newTChanIO
     let sourceCb a = ActiveYes <$ writeTChan c a
     source <- spawn scope (guardedConsume activeVar e sourceCb)
-    sink <- spawn scope (guardedProduce activeVar c f)
+    sink <- spawn scope (produce activeVar c f)
     wait source
     deactivateVarIO activeVar
     wait sink
