@@ -1,6 +1,5 @@
 module Tricksy.Internal where
 
-import Control.Applicative (Alternative (..))
 import Control.Concurrent.Async (Async, cancel, wait)
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
@@ -46,13 +45,15 @@ instance Applicative Events where
   pure a = Events (\cb -> atomically (void (cb a)))
   (<*>) = ap
 
-instance Alternative Events where
-  empty = Events (const (pure ()))
-  el <|> er = Events $ \cb -> scopedActive $ \activeVar scope -> do
-    al <- spawn scope (guardedConsume activeVar el cb)
-    ar <- spawn scope (guardedConsume activeVar er cb)
-    wait al
-    wait ar
+emptyE :: Events x
+emptyE = Events (const (pure ()))
+
+interleaveE :: Events x -> Events x -> Events x
+interleaveE el er = Events $ \cb -> scopedActive $ \activeVar scope -> do
+  al <- spawn scope (guardedConsume activeVar el cb)
+  ar <- spawn scope (guardedConsume activeVar er cb)
+  wait al
+  wait ar
 
 parallelE :: Foldable f => f (Events x) -> Events x
 parallelE es = Events $ \cb -> scopedActive $ \activeVar scope -> do
@@ -237,8 +238,8 @@ countE = scanE (const (+ 1)) 0
 enumerateE :: Events a -> Events (Int, a)
 enumerateE = accumE (\a i -> ((i, a), i + 1)) 0
 
-appendE :: Monoid a => Events a -> Events a
-appendE = scanE (flip (<>)) mempty
+mappendE :: Monoid a => Events a -> Events a
+mappendE = scanE (flip (<>)) mempty
 
 foldMapE :: Monoid b => (a -> b) -> Events a -> Events b
 foldMapE f = scanE (flip (<>) . f) mempty
@@ -285,7 +286,7 @@ data Behavior a
 
 instance Applicative Behavior where
   pure = BehaviorPure
-  (<*>) = undefined
+  (<*>) = undefined -- TODO
 
 holdB :: a -> Events a -> Behavior a
 holdB start e = BehaviorHold (pure (HoldBehavior start e Nothing))
@@ -391,7 +392,7 @@ tickE = fmap snd . periodicE
 
 -- | Actual time deltas since first tick
 timerE :: TimeDelta -> Events TimeDelta
-timerE = appendE . tickE
+timerE = mappendE . tickE
 
 produce :: ActiveVar -> TChan a -> (a -> IO Active) -> IO ()
 produce activeVar c f = go
