@@ -19,6 +19,16 @@ import Control.Monad ((>=>))
 data Active = ActiveNo | ActiveYes
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
+-- instance Semigroup Active where
+--   a <> b =
+--     case a of
+--       ActiveNo -> ActiveNo
+--       ActiveYes -> b
+
+-- instance Monoid Active where
+--   mempty = ActiveYes
+--   mappend = (<>)
+
 newtype ActiveVar = ActiveVar {unActiveVar :: TVar Active}
 
 newActiveVarIO :: IO ActiveVar
@@ -31,7 +41,7 @@ readActiveVarIO :: ActiveVar -> IO Active
 readActiveVarIO = readTVarIO . unActiveVar
 
 awaitActiveVar :: ActiveVar -> STM ()
-awaitActiveVar = readActiveVar >=> \case { ActiveYes -> retry; ActiveNo -> pure ()}
+awaitActiveVar = readActiveVar >=> \case ActiveYes -> retry; ActiveNo -> pure ()
 
 awaitActiveVarIO :: ActiveVar -> IO ()
 awaitActiveVarIO = atomically . awaitActiveVar

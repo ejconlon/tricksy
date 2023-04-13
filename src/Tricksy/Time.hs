@@ -1,11 +1,11 @@
 module Tricksy.Time
-  ( TimeDelta
+  ( TimeDelta (..)
   , timeDeltaFromFracSecs
   , timeDeltaFromNanos
   , timeDeltaToFracSecs
   , timeDeltaToNanos
   , diffTimeDelta
-  , MonoTime
+  , MonoTime (..)
   , monoTimeToFracSecs
   , monoTimeToNanos
   , monoTimeFromFracSecs
@@ -14,14 +14,12 @@ module Tricksy.Time
   , addMonoTime
   , diffMonoTime
   , threadDelayDelta
-  , awaitDelta
   , assertingNonNegative
   )
 where
 
 import Control.Concurrent (threadDelay)
 import Control.DeepSeq (NFData)
-import Data.Functor (($>))
 import Data.Semigroup (Sum (..))
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -99,19 +97,3 @@ diffMonoTime (MonoTime end) (MonoTime start) =
 
 threadDelayDelta :: TimeDelta -> IO ()
 threadDelayDelta (TimeDelta td) = threadDelay (fromIntegral (div td 1000))
-
-newtype Periods = Periods {unPeriods :: Word64}
-  deriving stock (Show)
-  deriving newtype (Eq, Ord, Num, NFData)
-  deriving (Semigroup, Monoid) via (Sum Word64)
-
-deltaForPeriods :: Periods -> TimeDelta -> TimeDelta
-deltaForPeriods (Periods p) (TimeDelta d) = TimeDelta (p * d)
-
-awaitDelta :: MonoTime -> TimeDelta -> IO MonoTime
-awaitDelta m t = do
-  let target = addMonoTime m t
-  cur <- currentMonoTime
-  case diffMonoTime target cur of
-    Nothing -> pure cur
-    Just td -> threadDelayDelta td $> target

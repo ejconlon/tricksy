@@ -1,17 +1,13 @@
 module Tricksy.ActiveScope
   ( scopedActive
-  , spawnActive
-  ) where
+  )
+where
 
-import Tricksy.Active (newActiveVarIO, deactivateVarIO, ActiveVar)
-import Tricksy.Scope (Scope, scoped, spawn)
-import Control.Exception (finally, onException)
-import Control.Concurrent.Async (Async)
+import Control.Exception (finally)
+import Tricksy.Active (ActiveVar, deactivateVarIO, newActiveVarIO)
+import Tricksy.Scope (Scope, scoped)
 
 scopedActive :: (forall s. ActiveVar -> Scope s -> IO a) -> IO a
 scopedActive f = do
   activeVar <- newActiveVarIO
   scoped (\scope -> finally (f activeVar scope) (deactivateVarIO activeVar))
-
-spawnActive :: ActiveVar -> Scope s -> IO a -> IO (Async a)
-spawnActive activeVar scope act = spawn scope (onException act (deactivateVarIO activeVar))

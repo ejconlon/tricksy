@@ -8,12 +8,11 @@ where
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.Async (Async, AsyncCancelled (..), async, asyncThreadId)
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, newTMVarIO, putTMVar, takeTMVar, tryPutTMVar, tryReadTMVar)
+import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, newTMVarIO, putTMVar, takeTMVar)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVarIO, swapTVar)
-import Control.Exception (AsyncException, Exception (..), SomeException, catch, finally, mask, throwIO, throwTo, SomeAsyncException)
-import Control.Monad (void, when)
+import Control.Exception (Exception (..), finally, mask, throwIO, throwTo)
+import Control.Monad (void)
 import Data.Foldable (for_)
-import Data.Maybe (isNothing)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
@@ -27,51 +26,31 @@ data SpawnError = SpawnError
 
 instance Exception SpawnError
 
-data ChildError = ChildError
-  deriving stock (Eq, Ord, Show)
-
-instance Exception ChildError
-
-isUsefulException :: SomeException -> Bool
-isUsefulException e =
-  isNothing (fromException @AsyncCancelled e) &&
-    isNothing (fromException @AsyncException e) &&
-    isNothing (fromException @SomeAsyncException e)
-
 data Scope s = Scope
   { scopeParentId :: !ThreadId
   , scopeStatusVar :: !(TMVar ScopeStatus)
-  , scopeChildExcVar :: !(TMVar SomeException)
   , scopeChildIdsVar :: !(TVar (Set ThreadId))
   }
 
 newScope :: ThreadId -> IO (Scope s)
-newScope pid = Scope pid <$> newTMVarIO ScopeStatusOpen <*> newEmptyTMVarIO <*> newTVarIO Set.empty
+newScope pid = Scope pid <$> newTMVarIO ScopeStatusOpen <*> newTVarIO Set.empty
 
 scoped :: (forall s. Scope s -> IO a) -> IO a
 scoped act = do
   pid <- myThreadId
   scope <- newScope pid
   finally (act scope) $ do
-    (childIds, mayExc) <- atomically $ do
+    childIds <- atomically $ do
       void (takeTMVar (scopeStatusVar scope))
-      childIds <- swapTVar (scopeChildIdsVar scope) Set.empty
-      mayExc <- tryReadTMVar (scopeChildExcVar scope)
-      pure (childIds, mayExc)
+      swapTVar (scopeChildIdsVar scope) Set.empty
     for_ childIds (`throwTo` AsyncCancelled)
     atomically (putTMVar (scopeStatusVar scope) ScopeStatusClosed)
-    maybe (pure ()) throwIO mayExc
 
 execute :: Scope s -> TMVar () -> IO a -> IO a
-execute scope lockVar act =
-  catch (atomically (takeTMVar lockVar) *> act) $ \e -> do
-    cid <- myThreadId
-    let useful = isUsefulException e
-    atomically $ do
-      when useful (void (tryPutTMVar (scopeChildExcVar scope) e))
-      modifyTVar (scopeChildIdsVar scope) (Set.delete cid)
-    when useful (throwTo (scopeParentId scope) ChildError)
-    throwIO e
+execute scope lockVar act = do
+  cid <- myThreadId
+  finally (atomically (takeTMVar lockVar) *> act) $
+    atomically (modifyTVar (scopeChildIdsVar scope) (Set.delete cid))
 
 spawn :: Scope s -> IO a -> IO (Async a)
 spawn scope act = mask $ \restore -> do
