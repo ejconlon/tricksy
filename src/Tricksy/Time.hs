@@ -100,7 +100,7 @@ diffMonoTime (MonoTime end) (MonoTime start) =
 threadDelayDelta :: TimeDelta -> IO ()
 threadDelayDelta (TimeDelta td) = threadDelay (fromIntegral (div td 1000))
 
-newtype Periods = Periods { unPeriods :: Word64 }
+newtype Periods = Periods {unPeriods :: Word64}
   deriving stock (Show)
   deriving newtype (Eq, Ord, Num, NFData)
   deriving (Semigroup, Monoid) via (Sum Word64)
