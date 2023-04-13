@@ -20,15 +20,15 @@ module Tricksy.Internal
 where
 
 import Control.Applicative (Alternative (..))
-import Control.Concurrent.Async (Async, cancel, concurrently_, mapConcurrently_, pollSTM, withAsync)
+import Control.Concurrent.Async (Async, cancel, concurrently_, mapConcurrently_, pollSTM, withAsync, async)
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally, mask, throwIO)
-import Control.Monad (void, when, (>=>))
+import Control.Monad (void, when, (>=>), ap)
 import Data.Bifunctor (first)
-import Data.Foldable (toList)
+import Data.Foldable (toList, traverse_)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.Time (MonoTime, TimeDelta, threadDelayDelta, currentMonoTime, addMonoTime, diffMonoTime)
@@ -61,9 +61,9 @@ guardedConsume activeVar e cb = consumeE e (guardedCall activeVar cb)
 -- | Consume async with thread killed when producer dies.
 guardedAsyncConsume :: ActiveVar -> Events a -> (a -> IO Active) -> IO ()
 guardedAsyncConsume activeVar e cb = do
-  withAsync (guardedConsume activeVar e cb) $ \async -> do
+  withAsync (guardedConsume activeVar e cb) $ \asy -> do
     (shouldCancel, merr) <- atomically $ do
-      mres <- pollSTM async
+      mres <- pollSTM asy
       case mres of
         Nothing -> do
           active <- readActiveVar activeVar
@@ -76,43 +76,12 @@ guardedAsyncConsume activeVar e cb = do
               deactivateVar activeVar
               pure (False, Just err)
             Right _ -> pure (False, Nothing)
-    let cleanup = when shouldCancel (cancel async)
+    let cleanup = when shouldCancel (cancel asy)
     maybe cleanup (finally cleanup . throwIO) merr
-
-data Ap a b = Ap
-  { apLeft :: !(Maybe (a -> b))
-  , apRight :: !(Maybe a)
-  }
-
-writeApLeft :: TVar (Ap a b) -> (a -> b) -> STM (Maybe b)
-writeApLeft apVar f = stateTVar apVar $ \(Ap _ ma) ->
-  let ap' = Ap (Just f) ma
-  in  case ma of
-        Nothing -> (Nothing, ap')
-        Just a -> (Just (f a), ap')
-
-writeApRight :: TVar (Ap a b) -> a -> STM (Maybe b)
-writeApRight apVar a = stateTVar apVar $ \(Ap mf _) ->
-  let ap' = Ap mf (Just a)
-  in  case mf of
-        Nothing -> (Nothing, ap')
-        Just f -> (Just (f a), ap')
-
-callAp :: TVar (Ap a b) -> (TVar (Ap a b) -> x -> STM (Maybe b)) -> (b -> IO Active) -> x -> IO Active
-callAp apVar write cb x = do
-  mb <- atomically (write apVar x)
-  case mb of
-    Nothing -> pure ActiveYes
-    Just b -> cb b
 
 instance Applicative Events where
   pure a = Events (\cb -> void (cb a))
-  el <*> er = Events $ \cb -> do
-    activeVar <- newActiveVarIO
-    apVar <- newTVarIO (Ap Nothing Nothing)
-    let cbl = callAp apVar writeApLeft cb
-        cbr = callAp apVar writeApRight cb
-    concurrently_ (guardedAsyncConsume activeVar el cbl) (guardedAsyncConsume activeVar er cbr)
+  (<*>) = ap
 
 instance Alternative Events where
   empty = Events (const (pure ()))
@@ -155,7 +124,26 @@ sequentialE es = res
 
 instance Monad Events where
   return = pure
-  _ea >>= _f = undefined
+  (>>=) = undefined
+  -- ea >>= f = Events go where
+  --   go cb = do
+  --     genVar <- newTVarIO (0 :: Int)
+  --     asyncVar <- newEmptyTMVarIO
+  --     activeVar <- newActiveVarIO
+  --     finally (goOuter genVar asyncVar activeVar cb) (goClean asyncVar)
+  --   goOuter genVar asyncVar activeVar cb = consumeE ea $ \a -> do
+  --     gen <- atomically (stateTVar genVar (\s -> (s, s + 1)))
+  --     goSpawn genVar asyncVar activeVar cb gen (f a)
+  --     readActiveVarIO activeVar
+  --   goClean asyncVar = atomically (tryTakeTMVar asyncVar) >>= traverse_ cancel
+  --   goSpawn genVar asyncVar activeVar cb gen eb = mask $ \restore -> do
+  --       newa <- async (restore (guardedConsume activeVar eb cb))
+  --       molda <- atomically $ do
+  --         molda <- tryTakeTMVar asyncVar
+  --         putTMVar asyncVar newa
+  --         pure molda
+  --       maybe (pure ()) cancel molda
+
 
 liftE :: IO a -> Events a
 liftE act = Events (\cb -> void (act >>= cb))
