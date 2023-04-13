@@ -1,10 +1,10 @@
 module Tricksy.Internal where
 
 import Control.Applicative (Alternative (..))
-import Control.Concurrent.Async (Async, wait)
-import Control.Concurrent.STM (STM, atomically, isEmptyTMVar, newEmptyTMVarIO, retry)
-import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, writeTChan, tryReadTChan)
-import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
+import Control.Concurrent.Async (Async, cancel, wait)
+import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
+import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
+import Control.Concurrent.STM.TMVar (TMVar, isEmptyTMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally, mask)
 import Control.Monad (ap, void, when)
@@ -14,7 +14,7 @@ import Data.Maybe (fromMaybe)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.ActiveScope (scopedActive)
-import Tricksy.Scope (Scope, spawn)
+import Tricksy.Scope (Scope, scoped, spawn)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 -- | Event producer - takes a consumer callback and pushes events through.
@@ -87,28 +87,38 @@ sequentialE es = res
           [] -> pure ()
           z' : zs' -> go activeVar z' zs' cbg
 
+forkSpawner :: ActiveVar -> Scope s -> TMVar a -> TMVar (Async ()) -> (a -> Events b) -> (b -> STM Active) -> IO ()
+forkSpawner activeVar scope sourceVar childVar f cb = go
+ where
+  go = do
+    mz <- atomically $ do
+      active <- readActiveVar activeVar
+      case active of
+        ActiveNo -> pure Nothing
+        ActiveYes -> do
+          a <- takeTMVar sourceVar
+          mx <- tryTakeTMVar childVar
+          pure (Just (a, mx))
+    case mz of
+      Nothing -> pure ()
+      Just (a, mx) -> do
+        for_ mx cancel
+        asy <- spawn scope (guardedConsume activeVar (f a) cb)
+        atomically (putTMVar childVar asy)
+        go
+
 instance Monad Events where
   return = pure
-  (>>=) = undefined
-
--- ea >>= f = Events go where
---   go cb = do
---     genVar <- newTVarIO (0 :: Int)
---     asyncVar <- newEmptyTMVarIO
---     activeVar <- newActiveVarIO
---     finally (goOuter genVar asyncVar activeVar cb) (goClean asyncVar)
---   goOuter genVar asyncVar activeVar cb = consumeE ea $ \a -> do
---     gen <- atomically (stateTVar genVar (\s -> (s, s + 1)))
---     goSpawn genVar asyncVar activeVar cb gen (f a)
---     readActiveVarIO activeVar
---   goClean asyncVar = atomically (tryTakeTMVar asyncVar) >>= traverse_ cancel
---   goSpawn genVar asyncVar activeVar cb gen eb = mask $ \restore -> do
---       newa <- async (restore (guardedConsume activeVar eb cb))
---       molda <- atomically $ do
---         molda <- tryTakeTMVar asyncVar
---         putTMVar asyncVar newa
---         pure molda
---       maybe (pure ()) cancel molda
+  ea >>= f = Events $ \cb -> do
+    sourceVar <- newEmptyTMVarIO
+    childVar <- newEmptyTMVarIO
+    scopedActive $ \activeVar scope -> do
+      source <- spawn scope (guardedConsume activeVar ea (\a -> ActiveYes <$ putTMVar sourceVar a))
+      spawner <- spawn scope (forkSpawner activeVar scope sourceVar childVar f cb)
+      wait source
+      wait spawner
+      mchild <- atomically (tryTakeTMVar childVar)
+      maybe (pure ()) wait mchild
 
 liftE :: IO a -> Events a
 liftE act = Events (\cb -> act >>= atomically . void . cb)
@@ -261,30 +271,33 @@ cycleE fa = Events (\cb -> let as0 = toList fa in case as0 of [] -> pure (); _ -
           ActiveNo -> pure ()
           ActiveYes -> go as0 as' cb
 
-data Hold a = Hold
-  { holdStart :: !a
-  , holdEvents :: !(Events a)
-  , holdRelease :: !(Maybe (IO ()))
+data HoldBehavior a = HoldBehavior
+  { hbStart :: !a
+  , hbEvents :: !(Events a)
+  , hbRelease :: !(Maybe (IO ()))
   }
   deriving stock (Functor)
 
 data Behavior a
   = BehaviorPure !a
-  | BehaviorHold !(IO (Hold a))
+  | BehaviorHold !(IO (HoldBehavior a))
   deriving stock (Functor)
 
 instance Applicative Behavior where
   pure = BehaviorPure
   (<*>) = undefined
 
-holdB :: IO (Hold a) -> Behavior a
-holdB = BehaviorHold
+holdB :: a -> Events a -> Behavior a
+holdB start e = BehaviorHold (pure (HoldBehavior start e Nothing))
+
+explicitHoldB :: IO (HoldBehavior a) -> Behavior a
+explicitHoldB = BehaviorHold
 
 edgeE :: Behavior a -> Events a
 edgeE = \case
   BehaviorPure a -> pure a
   BehaviorHold mh -> Events $ \cb -> mask $ \restore -> do
-    Hold start e mrel <- mh
+    HoldBehavior start e mrel <- mh
     let go = restore $ do
           active <- atomically (cb start)
           case active of
@@ -302,6 +315,16 @@ data Ref a
   = RefPure !a
   | RefHold !(HoldRef a)
 
+applyWithB :: (a -> b -> c) -> Behavior a -> Events b -> Events c
+applyWithB f b e = Events $ \cb -> do
+  scoped $ \scope -> do
+    r <- observeB scope b
+    consumeE e (\x -> readR r >>= cb . flip f x)
+    awaitR r
+
+applyB :: Behavior (a -> b) -> Events a -> Events b
+applyB = applyWithB ($)
+
 observeB :: Scope s -> Behavior a -> IO (Ref a)
 observeB scope = res
  where
@@ -310,7 +333,7 @@ observeB scope = res
     BehaviorHold mh -> do
       activeVar <- newActiveVarIO
       mask $ \restore -> do
-        Hold start e mrel <- mh
+        HoldBehavior start e mrel <- mh
         curVar <- newTVarIO start
         asy <-
           spawn scope $
@@ -324,8 +347,8 @@ readR = \case
   RefPure a -> pure a
   RefHold (HoldRef _ curVar _) -> readTVar curVar
 
-disposeR :: Ref a -> STM ()
-disposeR = \case
+deactivateR :: Ref a -> STM ()
+deactivateR = \case
   RefPure _ -> pure ()
   RefHold (HoldRef activeVar _ _) -> deactivateVar activeVar
 
@@ -334,11 +357,17 @@ activeR = \case
   RefPure _ -> pure ActiveNo
   RefHold (HoldRef activeVar _ _) -> readActiveVar activeVar
 
+awaitR :: Ref a -> IO ()
+awaitR = \case
+  RefPure _ -> pure ()
+  RefHold (HoldRef activeVar _ asy) -> deactivateVarIO activeVar *> wait asy
+
 -- | Delays the event stream by some 'TimeDelta'.
 -- The delay will happen on the consuming thread.
 delayE :: TimeDelta -> Events a -> Events a
 delayE delta e = Events (\cb -> threadDelayDelta delta *> consumeE e cb)
 
+-- | Try to emit (time, actual delta) with period delta
 periodicE :: TimeDelta -> Events (MonoTime, TimeDelta)
 periodicE delta = Events (\cb -> currentMonoTime >>= go cb)
  where
@@ -352,12 +381,15 @@ periodicE delta = Events (\cb -> currentMonoTime >>= go cb)
       ActiveNo -> pure ()
       ActiveYes -> go cb targetEdgeTime
 
+-- | Evently spaced times
 clockE :: TimeDelta -> Events MonoTime
 clockE = fmap fst . periodicE
 
+-- | Actual time deltas since previous tick
 tickE :: TimeDelta -> Events TimeDelta
 tickE = fmap snd . periodicE
 
+-- | Actual time deltas since first tick
 timerE :: TimeDelta -> Events TimeDelta
 timerE = appendE . tickE
 
@@ -382,16 +414,31 @@ produce activeVar c f = go
           ActiveNo -> deactivateVarIO activeVar
           ActiveYes -> go
 
-effectE :: (a -> IO Active) -> Events a -> IO ()
-effectE f e =
+-- | Runs the callback on all events in the stream.
+runE :: (a -> IO Active) -> Events a -> IO ()
+runE f e = do
+  c <- newTChanIO
+  let sourceCb a = ActiveYes <$ writeTChan c a
   scopedActive $ \activeVar scope -> do
-    c <- newTChanIO
-    let sourceCb a = ActiveYes <$ writeTChan c a
     source <- spawn scope (guardedConsume activeVar e sourceCb)
     sink <- spawn scope (produce activeVar c f)
     wait source
     deactivateVarIO activeVar
     wait sink
+
+-- | Creates an even stream from an IO action. Returning 'Nothing' ends the stream.
+repeatMayE :: IO (Maybe a) -> Events a
+repeatMayE f = Events go
+ where
+  go cb = do
+    ma <- f
+    case ma of
+      Nothing -> pure ()
+      Just a -> do
+        active <- atomically (cb a)
+        case active of
+          ActiveNo -> pure ()
+          ActiveYes -> go cb
 
 -- | Events from a (closable) channel
 channelE :: ActiveVar -> TChan a -> Events a
@@ -417,20 +464,11 @@ channelE activeVar chanVar = Events go
 
 -- | Reads to EOF
 stdinE :: Events String
-stdinE = Events go
- where
-  go cb = do
-    ms <- catchJust (\e -> if isEOFError e then Just () else Nothing) (fmap Just getLine) (const (pure Nothing))
-    case ms of
-      Nothing -> pure ()
-      Just s -> do
-        active <- atomically (cb s)
-        case active of
-          ActiveNo -> pure ()
-          ActiveYes -> go cb
+stdinE = repeatMayE (catchJust (\e -> if isEOFError e then Just () else Nothing) (fmap Just getLine) (const (pure Nothing)))
 
+-- | Prints events with timestamps
 debugPrintE :: Show a => Events a -> IO ()
-debugPrintE = effectE $ \a -> do
+debugPrintE = runE $ \a -> do
   m <- currentMonoTime
   print (m, a)
   pure ActiveYes

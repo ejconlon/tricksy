@@ -43,7 +43,7 @@ scoped act = do
     childIds <- atomically $ do
       void (takeTMVar (scopeStatusVar scope))
       swapTVar (scopeChildIdsVar scope) Set.empty
-    for_ childIds (`throwTo` AsyncCancelled)
+    for_ childIds stopThread
     atomically (putTMVar (scopeStatusVar scope) ScopeStatusClosed)
 
 execute :: Scope s -> TMVar () -> IO a -> IO a
@@ -65,3 +65,6 @@ spawn scope act = mask $ \restore -> do
           putTMVar lockVar ()
         pure asy
       ScopeStatusClosed -> throwIO SpawnError
+
+stopThread :: ThreadId -> IO ()
+stopThread = flip throwTo AsyncCancelled
