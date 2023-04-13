@@ -4,13 +4,16 @@ module Tricksy.Active
   , newActiveVarIO
   , readActiveVar
   , readActiveVarIO
+  , awaitActiveVar
+  , awaitActiveVarIO
   , deactivateVar
   , deactivateVarIO
   )
 where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM, atomically, retry)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Monad ((>=>))
 
 -- | Signal from consumers to producers
 data Active = ActiveNo | ActiveYes
@@ -26,6 +29,12 @@ readActiveVar = readTVar . unActiveVar
 
 readActiveVarIO :: ActiveVar -> IO Active
 readActiveVarIO = readTVarIO . unActiveVar
+
+awaitActiveVar :: ActiveVar -> STM ()
+awaitActiveVar = readActiveVar >=> \case { ActiveYes -> retry; ActiveNo -> pure ()}
+
+awaitActiveVarIO :: ActiveVar -> IO ()
+awaitActiveVarIO = atomically . awaitActiveVar
 
 deactivateVar :: ActiveVar -> STM ()
 deactivateVar = flip writeTVar ActiveNo . unActiveVar

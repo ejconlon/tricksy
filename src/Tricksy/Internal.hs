@@ -20,7 +20,7 @@ module Tricksy.Internal
 where
 
 import Control.Applicative (Alternative (..))
-import Control.Concurrent.Async (Async, async, cancel, concurrently_, mapConcurrently_, pollSTM, withAsync)
+import Control.Concurrent.Async (Async, async, cancel, concurrently_, mapConcurrently_, pollSTM, withAsync, wait)
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
@@ -28,10 +28,11 @@ import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, state
 import Control.Exception (catchJust, finally, mask, throwIO)
 import Control.Monad (ap, void, when, (>=>))
 import Data.Bifunctor (first)
-import Data.Foldable (toList, traverse_)
+import Data.Foldable (toList, traverse_, for_)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.Time (MonoTime, TimeDelta, addMonoTime, currentMonoTime, diffMonoTime, threadDelayDelta)
+import Tricksy.ActiveScope (scopedActive, spawnActive)
 
 -- | Event producer - takes a consumer callback and pushes events through.
 -- When the consumer callback signals not active, the producer should stop pushing.
@@ -85,14 +86,16 @@ instance Applicative Events where
 
 instance Alternative Events where
   empty = Events (const (pure ()))
-  el <|> er = Events $ \cb -> do
-    activeVar <- newActiveVarIO
-    concurrently_ (guardedAsyncConsume activeVar el cb) (guardedAsyncConsume activeVar er cb)
+  el <|> er = Events $ \cb -> scopedActive $ \activeVar scope -> do
+    al <- spawnActive activeVar scope (guardedConsume activeVar el cb)
+    ar <- spawnActive activeVar scope (guardedConsume activeVar er cb)
+    wait al
+    wait ar
 
 parallelE :: Foldable f => f (Events x) -> Events x
-parallelE es = Events $ \cb -> do
-  activeVar <- newActiveVarIO
-  mapConcurrently_ (\e -> guardedAsyncConsume activeVar e cb) es
+parallelE es = Events $ \cb -> scopedActive $ \activeVar scope -> do
+  as <- traverse (\e -> spawnActive activeVar scope (guardedConsume activeVar e cb)) (toList es)
+  for_ as wait
 
 andThenE :: Events x -> Events x -> Events x
 andThenE e1 e2 = Events $ \cb -> do
