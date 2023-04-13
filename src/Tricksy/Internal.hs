@@ -26,12 +26,12 @@ import Control.Concurrent.STM.TChan (TChan, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally, mask, throwIO)
-import Control.Monad (void, when)
+import Control.Monad (void, when, (>=>))
 import Data.Bifunctor (first)
 import Data.Foldable (toList)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
-import Tricksy.Time (MonoTime, TimeDelta)
+import Tricksy.Time (MonoTime, TimeDelta, threadDelayDelta, currentMonoTime, addMonoTime, diffMonoTime)
 
 -- | Event producer - takes a consumer callback and pushes events through.
 -- When the consumer callback signals not active, the producer should stop pushing.
@@ -374,20 +374,37 @@ disposeR = \case
   RefPure _ -> pure ()
   RefHold (HoldRef _ asy) -> cancel asy
 
+-- | Delays the event stream by some 'TimeDelta'.
+-- The delay will happen on the consuming thread.
+delayE :: TimeDelta -> Events a -> Events a
+delayE delta e = Events (\cb -> threadDelayDelta delta *> consumeE e cb)
+
+periodicE :: TimeDelta -> Events (MonoTime, TimeDelta)
+periodicE delta = Events (\cb -> currentMonoTime >>= go cb 0) where
+  go cb accDelta lastEdgeTime = do
+    let targetEdgeTime = addMonoTime lastEdgeTime delta
+    curTime <- currentMonoTime
+    let nextAccDelta = accDelta + delta
+    case diffMonoTime targetEdgeTime curTime of
+      Nothing -> go cb nextAccDelta targetEdgeTime
+      Just targetDelta -> do
+        threadDelayDelta targetDelta
+        active <- cb (targetEdgeTime, nextAccDelta)
+        case active of
+          ActiveNo -> pure ()
+          ActiveYes -> go cb 0 targetEdgeTime
+
 clockE :: TimeDelta -> Events MonoTime
-clockE = undefined
+clockE = fmap fst . periodicE
 
 pulseE :: TimeDelta -> Events ()
-pulseE = undefined
+pulseE = void . periodicE
 
 tickE :: TimeDelta -> Events TimeDelta
-tickE = undefined
+tickE = fmap snd . periodicE
 
 timerE :: TimeDelta -> Events TimeDelta
-timerE = undefined
-
--- periodic :: TimeDelta -> IO Active -> IO ()
--- periodic delta act = undefined
+timerE = appendE . tickE
 
 -- | Events from a (closable) channel
 channelE :: ActiveVar -> TChan a -> Events a

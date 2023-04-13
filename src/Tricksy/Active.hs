@@ -13,7 +13,7 @@ import Control.Concurrent.STM (STM, atomically)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, writeTVar)
 
 -- | Signal from consumers to producers
-data Active = ActiveYes | ActiveNo
+data Active = ActiveNo | ActiveYes
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 newtype ActiveVar = ActiveVar {unActiveVar :: TVar Active}

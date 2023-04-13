@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveAnyClass #-}
-
 module Tricksy.Time
   ( TimeDelta
   , timeDeltaFromFracSecs
@@ -27,7 +25,6 @@ import Data.Functor (($>))
 import Data.Semigroup (Sum (..))
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import GHC.Generics (Generic)
 import GHC.Stack (HasCallStack)
 
 assertingNonNegative :: (HasCallStack, Ord a, Num a, Show a) => a -> a
@@ -38,9 +35,8 @@ assertingNonNegative a =
 
 -- | Non-negative time difference in nanoseconds since last event
 newtype TimeDelta = TimeDelta {unTimeDelta :: Word64}
-  deriving stock (Eq, Show, Ord, Generic, Bounded)
-  deriving newtype (Num)
-  deriving anyclass (NFData)
+  deriving stock (Show)
+  deriving newtype (Eq, Ord, Num, Bounded, NFData)
   deriving (Semigroup, Monoid) via (Sum Word64)
 
 -- | Return a 'TimeDelta' corresponding the the given number of fractional seconds.
@@ -74,8 +70,8 @@ diffTimeDelta (TimeDelta big) (TimeDelta small) =
 
 -- | Monotonic time in nanoseconds since some unspecified epoch (see 'getMonotonicTimeNs')
 newtype MonoTime = MonoTime {unMonoTime :: Word64}
-  deriving stock (Eq, Show, Ord, Generic, Bounded)
-  deriving anyclass (NFData)
+  deriving stock (Show)
+  deriving newtype (Eq, Ord, Bounded, NFData)
 
 monoTimeFromFracSecs :: (Real a, Show a) => a -> MonoTime
 monoTimeFromFracSecs d = MonoTime (round (1000000000 * toRational (assertingNonNegative d)))
@@ -103,6 +99,14 @@ diffMonoTime (MonoTime end) (MonoTime start) =
 
 threadDelayDelta :: TimeDelta -> IO ()
 threadDelayDelta (TimeDelta td) = threadDelay (fromIntegral (div td 1000))
+
+newtype Periods = Periods { unPeriods :: Word64 }
+  deriving stock (Show)
+  deriving newtype (Eq, Ord, Num, NFData)
+  deriving (Semigroup, Monoid) via (Sum Word64)
+
+deltaForPeriods :: Periods -> TimeDelta -> TimeDelta
+deltaForPeriods (Periods p) (TimeDelta d) = TimeDelta (p * d)
 
 awaitDelta :: MonoTime -> TimeDelta -> IO MonoTime
 awaitDelta m t = do
