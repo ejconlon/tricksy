@@ -2,7 +2,7 @@ module Tricksy.Internal where
 
 import Control.Applicative (liftA2)
 import Control.Concurrent.Async (Async, cancel, wait)
-import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
@@ -11,6 +11,8 @@ import Control.Monad (ap, void, when)
 import Data.Bifunctor (first)
 import Data.Foldable (for_, toList)
 import Data.Maybe (fromMaybe)
+import Data.Sequence (Seq (..))
+import Data.Sequence qualified as Seq
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.ActiveScope (scopedActive)
@@ -147,6 +149,21 @@ eachE fa = Events (go (toList fa))
         case active of
           ActiveNo -> pure ()
           ActiveYes -> go as' cb
+
+-- rawBuffer :: (b -> Events a) -> b -> (a -> STM ()) -> Events a
+-- rawBuffer f b w = Events (\cb -> consumeE (f b) (\a -> w a *> cb a))
+
+capSnoc :: Int -> TVar (Seq a) -> a -> STM ()
+capSnoc cap v a =
+  modifyTVar' v $ \case
+    Empty -> Empty :|> a
+    s@(_ :<| t) -> (if Seq.length s >= cap then t else s) :|> a
+
+-- | Fulfills the role of fix
+bufferE :: Int -> (STM (Seq a) -> Events a) -> Events a
+bufferE cap f = Events $ \cb -> do
+  aVar <- newTVarIO Seq.empty
+  consumeE (f (readTVar aVar)) (\a -> capSnoc cap aVar a *> cb a)
 
 callZipWith :: (a -> b -> c) -> TVar (Maybe a) -> TVar (Maybe b) -> (c -> STM Active) -> a -> STM Active
 callZipWith f aVar bVar cb a = do
