@@ -1,9 +1,10 @@
 module Tricksy.Internal where
 
+import Control.Applicative (liftA2)
 import Control.Concurrent.Async (Async, cancel, wait)
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
-import Control.Concurrent.STM.TMVar (TMVar, isEmptyTMVar, putTMVar, takeTMVar, tryTakeTMVar)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally, mask)
 import Control.Monad (ap, void, when)
@@ -13,7 +14,7 @@ import Data.Maybe (fromMaybe)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.ActiveScope (scopedActive)
-import Tricksy.Scope (Scope, scoped, spawn)
+import Tricksy.Scope (Scope, scoped, spawnAsync)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 -- | Event producer - takes a consumer callback and pushes events through.
@@ -50,14 +51,14 @@ emptyE = Events (const (pure ()))
 
 interleaveE :: Events x -> Events x -> Events x
 interleaveE el er = Events $ \cb -> scopedActive $ \activeVar scope -> do
-  al <- spawn scope (guardedConsume activeVar el cb)
-  ar <- spawn scope (guardedConsume activeVar er cb)
+  al <- spawnAsync scope (guardedConsume activeVar el cb)
+  ar <- spawnAsync scope (guardedConsume activeVar er cb)
   wait al
   wait ar
 
 parallelE :: Foldable f => f (Events x) -> Events x
 parallelE es = Events $ \cb -> scopedActive $ \activeVar scope -> do
-  as <- traverse (\e -> spawn scope (guardedConsume activeVar e cb)) (toList es)
+  as <- traverse (\e -> spawnAsync scope (guardedConsume activeVar e cb)) (toList es)
   for_ as wait
 
 andThenE :: Events x -> Events x -> Events x
@@ -104,7 +105,7 @@ forkSpawner activeVar scope sourceVar childVar f cb = go
       Nothing -> pure ()
       Just (a, mx) -> do
         for_ mx cancel
-        asy <- spawn scope (guardedConsume activeVar (f a) cb)
+        asy <- spawnAsync scope (guardedConsume activeVar (f a) cb)
         atomically (putTMVar childVar asy)
         go
 
@@ -114,8 +115,8 @@ instance Monad Events where
     sourceVar <- newEmptyTMVarIO
     childVar <- newEmptyTMVarIO
     scopedActive $ \activeVar scope -> do
-      source <- spawn scope (guardedConsume activeVar ea (\a -> ActiveYes <$ putTMVar sourceVar a))
-      spawner <- spawn scope (forkSpawner activeVar scope sourceVar childVar f cb)
+      source <- spawnAsync scope (guardedConsume activeVar ea (\a -> ActiveYes <$ putTMVar sourceVar a))
+      spawner <- spawnAsync scope (forkSpawner activeVar scope sourceVar childVar f cb)
       wait source
       wait spawner
       mchild <- atomically (tryTakeTMVar childVar)
@@ -146,31 +147,24 @@ eachE fa = Events (go (toList fa))
           ActiveNo -> pure ()
           ActiveYes -> go as' cb
 
-callZipWith :: (a -> b -> c) -> TMVar a -> TMVar b -> (c -> STM Active) -> a -> STM Active
+callZipWith :: (a -> b -> c) -> TVar (Maybe a) -> TVar (Maybe b) -> (c -> STM Active) -> a -> STM Active
 callZipWith f aVar bVar cb a = do
-  putTMVar aVar a
-  mb <- tryTakeTMVar bVar
+  void (writeTVar aVar (Just a))
+  mb <- readTVar bVar
   case mb of
-    Nothing ->
-      pure ActiveYes
-    Just b -> do
-      _ <- takeTMVar aVar
-      cb (f a b)
+    Nothing -> pure ActiveYes
+    Just b -> cb (f a b)
 
 zipWithE :: (a -> b -> c) -> Events a -> Events b -> Events c
 zipWithE f ea eb = Events $ \cb -> do
-  aVar <- newEmptyTMVarIO
-  bVar <- newEmptyTMVarIO
+  aVar <- newTVarIO Nothing
+  bVar <- newTVarIO Nothing
   let cba = callZipWith f aVar bVar cb
       cbb = callZipWith (flip f) bVar aVar cb
   scopedActive $ \activeVar scope -> do
-    aa <- spawn scope (guardedConsume activeVar ea cba)
-    ab <- spawn scope (guardedConsume activeVar eb cbb)
+    aa <- spawnAsync scope (guardedConsume activeVar ea cba)
+    ab <- spawnAsync scope (guardedConsume activeVar eb cbb)
     wait aa
-    -- Don't leave B hanging on an A that will never arrive
-    atomically $ do
-      missingA <- isEmptyTMVar aVar
-      when missingA (deactivateVar activeVar)
     wait ab
 
 zipE :: Events a -> Events b -> Events (a, b)
@@ -279,6 +273,14 @@ data HoldBehavior a = HoldBehavior
   }
   deriving stock (Functor)
 
+applyWithH :: (a -> b -> c) -> HoldBehavior a -> HoldBehavior b -> HoldBehavior c
+applyWithH f (HoldBehavior sa ea ra) (HoldBehavior sb eb rb) = HoldBehavior (f sa sb) (zipWithE f ea eb) rx
+ where
+  rx = maybe rb (\a -> maybe ra (Just . finally a) rb) ra
+
+applyH :: HoldBehavior (a -> b) -> HoldBehavior a -> HoldBehavior b
+applyH = applyWithH ($)
+
 data Behavior a
   = BehaviorPure !a
   | BehaviorHold !(IO (HoldBehavior a))
@@ -286,7 +288,10 @@ data Behavior a
 
 instance Applicative Behavior where
   pure = BehaviorPure
-  (<*>) = undefined -- TODO
+  BehaviorPure f <*> BehaviorPure a = BehaviorPure (f a)
+  BehaviorPure f <*> BehaviorHold mha = BehaviorHold (fmap (fmap f) mha)
+  BehaviorHold mhf <*> BehaviorPure a = BehaviorHold (fmap (fmap (\f -> f a)) mhf)
+  BehaviorHold mhf <*> BehaviorHold mha = BehaviorHold (liftA2 applyH mhf mha)
 
 holdB :: a -> Events a -> Behavior a
 holdB start e = BehaviorHold (pure (HoldBehavior start e Nothing))
@@ -337,7 +342,7 @@ observeB scope = res
         HoldBehavior start e mrel <- mh
         curVar <- newTVarIO start
         asy <-
-          spawn scope $
+          spawnAsync scope $
             finally
               (restore (guardedConsume activeVar e (\a -> ActiveYes <$ writeTVar curVar a)))
               (deactivateVarIO activeVar *> fromMaybe (pure ()) mrel)
@@ -421,8 +426,8 @@ runE f e = do
   c <- newTChanIO
   let sourceCb a = ActiveYes <$ writeTChan c a
   scopedActive $ \activeVar scope -> do
-    source <- spawn scope (guardedConsume activeVar e sourceCb)
-    sink <- spawn scope (produce activeVar c f)
+    source <- spawnAsync scope (guardedConsume activeVar e sourceCb)
+    sink <- spawnAsync scope (produce activeVar c f)
     wait source
     deactivateVarIO activeVar
     wait sink

@@ -29,6 +29,7 @@ library
       Tricksy
       Tricksy.Active
       Tricksy.ActiveScope
+      Tricksy.Cache
       Tricksy.Internal
       Tricksy.Scope
       Tricksy.Time
