@@ -14,6 +14,7 @@ import Data.Maybe (fromMaybe)
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, deactivateVarIO, newActiveVarIO, readActiveVar, readActiveVarIO)
 import Tricksy.ActiveScope (scopedActive)
+import Tricksy.Cache (CacheHandler)
 import Tricksy.Scope (Scope, scoped, spawnAsync)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
@@ -266,50 +267,74 @@ cycleE fa = Events (\cb -> let as0 = toList fa in case as0 of [] -> pure (); _ -
           ActiveNo -> pure ()
           ActiveYes -> go as0 as' cb
 
-data HoldBehavior a = HoldBehavior
-  { hbStart :: !a
-  , hbEvents :: !(Events a)
-  , hbRelease :: !(Maybe (IO ()))
+newtype Alloc x = Alloc {unAlloc :: IO (x, Maybe (IO ()))}
+
+instance Functor Alloc where
+  fmap f (Alloc m) = Alloc (fmap (first f) m)
+
+data CacheBehaviorSpec a where
+  CacheBehaviorSpec :: !TimeDelta -> !(CacheHandler z a) -> !(IO z) -> CacheBehaviorSpec a
+
+instance Functor CacheBehaviorSpec where
+  fmap f (CacheBehaviorSpec ttl han act) = CacheBehaviorSpec ttl (fmap f . han) act
+
+newtype CacheBehavior a = CacheBehavior {unCacheBehavior :: Alloc (CacheBehaviorSpec a)}
+
+instance Functor CacheBehavior where
+  fmap f = CacheBehavior . fmap (fmap f) . unCacheBehavior
+
+data HoldBehaviorSpec a = HoldBehaviorSpec
+  { hbsStart :: !a
+  , hbsEvents :: !(Events a)
   }
   deriving stock (Functor)
 
-applyWithH :: (a -> b -> c) -> HoldBehavior a -> HoldBehavior b -> HoldBehavior c
-applyWithH f (HoldBehavior sa ea ra) (HoldBehavior sb eb rb) = HoldBehavior (f sa sb) (zipWithE f ea eb) rx
- where
-  rx = maybe rb (\a -> maybe ra (Just . finally a) rb) ra
+newtype HoldBehavior a = HoldBehavior {unHoldBehavior :: Alloc (HoldBehaviorSpec a)}
 
-applyH :: HoldBehavior (a -> b) -> HoldBehavior a -> HoldBehavior b
-applyH = applyWithH ($)
+instance Functor HoldBehavior where
+  fmap f = HoldBehavior . fmap (fmap f) . unHoldBehavior
+
+-- applyWithH :: (a -> b -> c) -> HoldBehavior a -> HoldBehavior b -> HoldBehavior c
+-- applyWithH f (HoldBehavior sa ea ra) (HoldBehavior sb eb rb) = HoldBehavior (f sa sb) (zipWithE f ea eb) rx
+--  where
+--   rx = maybe rb (\a -> maybe ra (Just . finally a) rb) ra
+
+-- applyH :: HoldBehavior (a -> b) -> HoldBehavior a -> HoldBehavior b
+-- applyH = applyWithH ($)
+
+data MergeBehavior a where
+  MergeBehavior :: (x -> y -> a) -> Behavior x -> Behavior y -> MergeBehavior a
+
+instance Functor MergeBehavior where
+  fmap f (MergeBehavior g bx by) = MergeBehavior (\x y -> f (g x y)) bx by
 
 data Behavior a
   = BehaviorPure !a
-  | BehaviorHold !(IO (HoldBehavior a))
+  | BehaviorCache !(CacheBehavior a)
+  | BehaviorHold !(HoldBehavior a)
+  | BehaviorMerge (MergeBehavior a)
   deriving stock (Functor)
 
 instance Applicative Behavior where
   pure = BehaviorPure
-  BehaviorPure f <*> BehaviorPure a = BehaviorPure (f a)
-  BehaviorPure f <*> BehaviorHold mha = BehaviorHold (fmap (fmap f) mha)
-  BehaviorHold mhf <*> BehaviorPure a = BehaviorHold (fmap (fmap (\f -> f a)) mhf)
-  BehaviorHold mhf <*> BehaviorHold mha = BehaviorHold (liftA2 applyH mhf mha)
+  liftA2 f bx by = BehaviorMerge (MergeBehavior f bx by)
+
+cacheB :: TimeDelta -> CacheHandler z a -> IO z -> Behavior a
+cacheB ttl han act = BehaviorCache (CacheBehavior (Alloc (pure (CacheBehaviorSpec ttl han act, Nothing))))
+
+explicitCacheB :: CacheBehavior a -> Behavior a
+explicitCacheB = BehaviorCache
 
 holdB :: a -> Events a -> Behavior a
-holdB start e = BehaviorHold (pure (HoldBehavior start e Nothing))
+holdB start e = BehaviorHold (HoldBehavior (Alloc (pure (HoldBehaviorSpec start e, Nothing))))
 
-explicitHoldB :: IO (HoldBehavior a) -> Behavior a
+explicitHoldB :: HoldBehavior a -> Behavior a
 explicitHoldB = BehaviorHold
 
-edgeE :: Behavior a -> Events a
-edgeE = \case
-  BehaviorPure a -> pure a
-  BehaviorHold mh -> Events $ \cb -> mask $ \restore -> do
-    HoldBehavior start e mrel <- mh
-    let go = restore $ do
-          active <- atomically (cb start)
-          case active of
-            ActiveNo -> pure ()
-            ActiveYes -> consumeE e cb
-    maybe go (finally go) mrel
+data CacheRef a = CacheRef
+  { crActiveVar :: !ActiveVar
+  , crAction :: !(STM a)
+  }
 
 data HoldRef a = HoldRef
   { hrActiveVar :: !ActiveVar
@@ -319,6 +344,7 @@ data HoldRef a = HoldRef
 
 data Ref a
   = RefPure !a
+  | RefCache !(CacheRef a)
   | RefHold !(HoldRef a)
 
 applyWithB :: (a -> b -> c) -> Behavior a -> Events b -> Events c
@@ -326,7 +352,7 @@ applyWithB f b e = Events $ \cb -> do
   scoped $ \scope -> do
     r <- observeB scope b
     consumeE e (\x -> readR r >>= cb . flip f x)
-    awaitR r
+    finalizeR r
 
 applyB :: Behavior (a -> b) -> Events a -> Events b
 applyB = applyWithB ($)
@@ -336,10 +362,11 @@ observeB scope = res
  where
   res = \case
     BehaviorPure a -> pure (RefPure a)
-    BehaviorHold mh -> do
+    BehaviorCache _ -> error "TODO"
+    BehaviorHold (HoldBehavior (Alloc mp)) -> do
       activeVar <- newActiveVarIO
       mask $ \restore -> do
-        HoldBehavior start e mrel <- mh
+        (HoldBehaviorSpec start e, mrel) <- mp
         curVar <- newTVarIO start
         asy <-
           spawnAsync scope $
@@ -347,25 +374,18 @@ observeB scope = res
               (restore (guardedConsume activeVar e (\a -> ActiveYes <$ writeTVar curVar a)))
               (deactivateVarIO activeVar *> fromMaybe (pure ()) mrel)
         pure (RefHold (HoldRef activeVar curVar asy))
+    BehaviorMerge {} -> error "TODO"
 
 readR :: Ref a -> STM a
 readR = \case
   RefPure a -> pure a
+  RefCache _ -> error "TODO"
   RefHold (HoldRef _ curVar _) -> readTVar curVar
 
-deactivateR :: Ref a -> STM ()
-deactivateR = \case
+finalizeR :: Ref a -> IO ()
+finalizeR = \case
   RefPure _ -> pure ()
-  RefHold (HoldRef activeVar _ _) -> deactivateVar activeVar
-
-activeR :: Ref a -> STM Active
-activeR = \case
-  RefPure _ -> pure ActiveNo
-  RefHold (HoldRef activeVar _ _) -> readActiveVar activeVar
-
-awaitR :: Ref a -> IO ()
-awaitR = \case
-  RefPure _ -> pure ()
+  RefCache _ -> error "TODO"
   RefHold (HoldRef activeVar _ asy) -> deactivateVarIO activeVar *> wait asy
 
 -- | Delays the event stream by some 'TimeDelta'.
