@@ -1,12 +1,12 @@
 module Tricksy.Internal where
 
 import Control.Applicative (liftA2)
-import Control.Concurrent.Async (Async, cancel, wait)
+import Control.Concurrent.Async (wait)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
-import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
-import Control.Exception (catchJust)
+import Control.Exception (catchJust, finally)
 import Control.Monad (ap, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
@@ -14,11 +14,11 @@ import Data.Foldable (for_, toList)
 import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
 import System.IO.Error (isEOFError)
-import Tricksy.Active (Active (..), ActiveVar, deactivateVar, readActiveVar, readActiveVarIO, trackActive)
+import Tricksy.Active (Active (..), ActiveVar, deactivateVar, newActiveVarIO, readActiveVar, readActiveVarIO, trackActive)
 import Tricksy.ActiveScope (allocateActiveVar, scopedActive)
 import Tricksy.Barrier (newBarrier, trackBarrier)
 import Tricksy.Cache (CacheHandler)
-import Tricksy.Monad (ResM, runResM, scoped, spawnAsync, spawnThread)
+import Tricksy.Monad (ResM, runResM, scoped, spawnAsync, spawnThread, stopThread)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 -- | Event producer - takes a consumer callback and pushes events through.
@@ -92,37 +92,61 @@ sequentialE es = res
           [] -> pure ()
           z' : zs' -> go activeVar z' zs' cbg
 
-forkSpawner :: ActiveVar -> TMVar a -> TMVar (Async ()) -> (a -> Events b) -> (b -> STM Active) -> ResM ()
-forkSpawner activeVar sourceVar childVar f cb = go
+spawnChild :: ActiveVar -> ActiveVar -> TMVar a -> TVar Int -> (a -> Events b) -> (b -> STM Active) -> IO ()
+spawnChild activeVar parentActiveVar sourceVar genVar f cb = runResM (go Nothing)
  where
-  go = do
+  go mc = do
     mz <- liftIO $ atomically $ do
       active <- readActiveVar activeVar
       case active of
         ActiveNo -> pure Nothing
         ActiveYes -> do
-          a <- takeTMVar sourceVar
-          mx <- tryTakeTMVar childVar
-          pure (Just (a, mx))
+          ma <- tryTakeTMVar sourceVar
+          case ma of
+            Nothing -> do
+              parentActive <- readActiveVar parentActiveVar
+              case parentActive of
+                ActiveNo -> pure Nothing
+                ActiveYes -> retry
+            Just a -> do
+              g <- stateTVar genVar (\g -> (g, g + 1))
+              pure (Just (a, g))
     case mz of
       Nothing -> pure ()
-      Just (a, mx) -> do
-        for_ mx (liftIO . cancel)
-        asy <- spawnAsync (runResM (guardedProduce activeVar (f a) cb))
-        liftIO (atomically (putTMVar childVar asy))
-        go
+      Just (a, g) -> do
+        case mc of
+          Just cid -> liftIO (stopThread cid)
+          Nothing -> pure ()
+        c <- spawnThread (childProduce activeVar parentActiveVar genVar g (f a) cb)
+        go (Just c)
+
+childProduce :: ActiveVar -> ActiveVar -> TVar Int -> Int -> Events b -> (b -> STM Active) -> IO ()
+childProduce activeVar parentActiveVar genVar myGen e cb = finally prod clean
+ where
+  prod = runResM (guardedProduce activeVar e cb)
+  clean = atomically $ do
+    parentActive <- readActiveVar parentActiveVar
+    case parentActive of
+      ActiveYes -> pure ()
+      ActiveNo -> do
+        curGen <- readTVar genVar
+        when (curGen == myGen) (deactivateVar activeVar)
+
+parentProduce :: ActiveVar -> ActiveVar -> TMVar a -> Events a -> IO ()
+parentProduce activeVar parentActiveVar sourceVar ea =
+  finally
+    (runResM (guardedProduce activeVar ea (\a -> ActiveYes <$ putTMVar sourceVar a)))
+    (atomically (deactivateVar parentActiveVar))
 
 instance Monad Events where
   return = pure
   ea >>= f = Events $ \cb -> do
+    parentActiveVar <- liftIO newActiveVarIO
     sourceVar <- liftIO newEmptyTMVarIO
-    childVar <- liftIO newEmptyTMVarIO
+    genVar <- liftIO (newTVarIO 0)
     scopedActive $ \activeVar -> do
-      barrier <- liftIO (atomically (newBarrier 3 activeVar))
-      void (spawnThread (trackBarrier barrier (runResM (guardedProduce activeVar ea (\a -> ActiveYes <$ putTMVar sourceVar a)))))
-      void (spawnThread (trackBarrier barrier (runResM (forkSpawner activeVar sourceVar childVar f cb))))
-
--- TODO XXXXXXXX
+      void (spawnThread (parentProduce activeVar parentActiveVar sourceVar ea))
+      void (spawnThread (spawnChild activeVar parentActiveVar sourceVar genVar f cb))
 
 liftE :: IO a -> Events a
 liftE act = Events (\cb -> liftIO (act >>= atomically . void . cb))

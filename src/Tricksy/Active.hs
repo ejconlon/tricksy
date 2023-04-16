@@ -20,16 +20,6 @@ import Control.Monad ((>=>))
 data Active = ActiveNo | ActiveYes
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
--- instance Semigroup Active where
---   a <> b =
---     case a of
---       ActiveNo -> ActiveNo
---       ActiveYes -> b
-
--- instance Monoid Active where
---   mempty = ActiveYes
---   mappend = (<>)
-
 newtype ActiveVar = ActiveVar {unActiveVar :: TVar Active}
 
 newActiveVar :: STM ActiveVar

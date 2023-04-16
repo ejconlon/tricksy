@@ -11,13 +11,14 @@ module Tricksy.Monad
   , scoped
   , spawnThread
   , spawnAsync
+  , stopThread
   )
 where
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo)
 import Control.Concurrent.Async (Async (..), AsyncCancelled (..), async)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Exception (AsyncException, SomeAsyncException, SomeException, throwIO)
+import Control.Exception (AsyncException, SomeAsyncException, SomeException, catch, throwIO)
 import Control.Monad (void, when)
 import Control.Monad.Catch (Exception (fromException), MonadCatch, MonadMask (..), MonadThrow, try)
 import Control.Monad.IO.Class (MonadIO (..))
@@ -80,12 +81,15 @@ spawnWith k act = ResM $ mask $ \restore -> do
       Right _ -> pure ()
       Left err -> when (reraisable err) (liftIO (throwTo pid (ReraiseError err)))
     either (liftIO . throwIO) pure res
-  void (R.register (throwTo cid AsyncCancelled *> readMVar endVar))
+  void (R.register (stopThread cid *> readMVar endVar))
   liftIO (putMVar startVar ())
   pure b
 
 spawnThread :: IO () -> ResM ThreadId
-spawnThread = spawnWith (fmap (\tid -> (tid, tid)) . forkIO)
+spawnThread = spawnWith (\act -> fmap (\tid -> (tid, tid)) (forkIO (catch @AsyncCancelled act (const (pure ())))))
 
 spawnAsync :: IO a -> ResM (Async a)
 spawnAsync = spawnWith (fmap (\asy -> (asyncThreadId asy, asy)) . async)
+
+stopThread :: ThreadId -> IO ()
+stopThread = flip throwTo AsyncCancelled
