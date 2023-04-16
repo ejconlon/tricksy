@@ -5,7 +5,7 @@ module Tricksy.Active
   , newActiveVarIO
   , readActiveVar
   , readActiveVarIO
-  , awaitActiveVar
+  , waitActiveVar
   , deactivateVar
   , trackActive
   )
@@ -34,8 +34,8 @@ readActiveVar = readTVar . unActiveVar
 readActiveVarIO :: ActiveVar -> IO Active
 readActiveVarIO = readTVarIO . unActiveVar
 
-awaitActiveVar :: ActiveVar -> STM ()
-awaitActiveVar = readActiveVar >=> \case ActiveYes -> retry; ActiveNo -> pure ()
+waitActiveVar :: ActiveVar -> STM ()
+waitActiveVar = readActiveVar >=> \case ActiveYes -> retry; ActiveNo -> pure ()
 
 deactivateVar :: ActiveVar -> STM ()
 deactivateVar = flip writeTVar ActiveNo . unActiveVar

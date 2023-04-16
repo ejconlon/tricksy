@@ -16,9 +16,8 @@ import Data.Sequence qualified as Seq
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, newActiveVarIO, readActiveVar, readActiveVarIO, trackActive)
 import Tricksy.ActiveScope (allocateActiveVar, scopedActive)
-import Tricksy.Barrier (newBarrier, trackBarrier)
 import Tricksy.Cache (CacheHandler)
-import Tricksy.Monad (ResM, runResM, scoped, spawnAsync, spawnThread, stopThread)
+import Tricksy.Monad (ResM, runResM, spawnAsync, spawnThread, stopThread)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 -- | Event producer - takes a consumer callback and pushes events through.
@@ -28,23 +27,29 @@ newtype Events a = Events {produceE :: (a -> STM Active) -> ResM ()}
 instance Functor Events where
   fmap f e = Events (\cb -> produceE e (cb . f))
 
--- | Wrap a callback to check producer liveness before invoking callback and
--- to update the var after invoking it.
-guardedCall :: ActiveVar -> (a -> STM Active) -> a -> STM Active
-guardedCall activeVar cb a = do
-  active <- readActiveVar activeVar
+rawGuardedCall :: STM Active -> STM () -> (a -> STM Active) -> a -> STM Active
+rawGuardedCall readActive deactivate cb a = do
+  active <- readActive
   case active of
     ActiveNo -> pure ActiveNo
     ActiveYes -> do
       stillActive <- cb a
       case stillActive of
-        ActiveNo -> deactivateVar activeVar
+        ActiveNo -> deactivate
         ActiveYes -> pure ()
       pure stillActive
 
+-- | Wrap a callback to check producer liveness before invoking callback and
+-- to update the var after invoking it.
+guardedCall :: ActiveVar -> (a -> STM Active) -> a -> STM Active
+guardedCall activeVar = rawGuardedCall (readActiveVar activeVar) (deactivateVar activeVar)
+
+rawGuardedProduce :: STM Active -> STM () -> Events a -> (a -> STM Active) -> ResM ()
+rawGuardedProduce readActive deactivate e cb = produceE e (rawGuardedCall readActive deactivate cb)
+
 -- | Consume while checking producer liveness.
 guardedProduce :: ActiveVar -> Events a -> (a -> STM Active) -> ResM ()
-guardedProduce activeVar e cb = produceE e (guardedCall activeVar cb)
+guardedProduce activeVar = rawGuardedProduce (readActiveVar activeVar) (deactivateVar activeVar)
 
 instance Applicative Events where
   pure a = Events (\cb -> liftIO (atomically (void (cb a))))
@@ -55,14 +60,12 @@ emptyE = Events (const (pure ()))
 
 interleaveE :: Events x -> Events x -> Events x
 interleaveE el er = Events $ \cb -> scopedActive $ \activeVar -> do
-  barrier <- liftIO (atomically (newBarrier 2 activeVar))
-  void (spawnThread (trackBarrier barrier (runResM (guardedProduce activeVar el cb))))
-  void (spawnThread (trackBarrier barrier (runResM (guardedProduce activeVar er cb))))
+  void (spawnThread (runResM (guardedProduce activeVar el cb)))
+  void (spawnThread (runResM (guardedProduce activeVar er cb)))
 
 parallelE :: Foldable f => f (Events x) -> Events x
 parallelE es = Events $ \cb -> scopedActive $ \activeVar -> do
-  barrier <- liftIO (atomically (newBarrier (length es) activeVar))
-  for_ es (\e -> spawnThread (trackBarrier barrier (runResM (guardedProduce activeVar e cb))))
+  for_ es (\e -> spawnThread (runResM (guardedProduce activeVar e cb)))
 
 andThenE :: Events x -> Events x -> Events x
 andThenE e1 e2 = Events $ \cb -> do
@@ -109,7 +112,7 @@ spawnChild activeVar parentActiveVar sourceVar genVar f cb = runResM (go Nothing
                 ActiveNo -> pure Nothing
                 ActiveYes -> retry
             Just a -> do
-              g <- stateTVar genVar (\g -> (g, g + 1))
+              g <- readTVar genVar
               pure (Just (a, g))
     case mz of
       Nothing -> pure ()
@@ -117,26 +120,26 @@ spawnChild activeVar parentActiveVar sourceVar genVar f cb = runResM (go Nothing
         case mc of
           Just cid -> liftIO (stopThread cid)
           Nothing -> pure ()
-        c <- spawnThread (childProduce activeVar parentActiveVar genVar g (f a) cb)
+        c <- spawnThread (childProduce activeVar genVar g (f a) cb)
         go (Just c)
 
-childProduce :: ActiveVar -> ActiveVar -> TVar Int -> Int -> Events b -> (b -> STM Active) -> IO ()
-childProduce activeVar parentActiveVar genVar myGen e cb = finally prod clean
- where
-  prod = runResM (guardedProduce activeVar e cb)
-  clean = atomically $ do
-    parentActive <- readActiveVar parentActiveVar
-    case parentActive of
-      ActiveYes -> pure ()
-      ActiveNo -> do
-        curGen <- readTVar genVar
-        when (curGen == myGen) (deactivateVar activeVar)
+childProduce :: ActiveVar -> TVar Int -> Int -> Events b -> (b -> STM Active) -> IO ()
+childProduce activeVar genVar myGen e cb =
+  let readIsMyGen = fmap (== myGen) (readTVar genVar)
+      readActive = do
+        isMyGen <- readIsMyGen
+        if isMyGen then readActiveVar activeVar else pure ActiveNo
+      deactivate = deactivateVar activeVar
+  in  runResM (rawGuardedProduce readActive deactivate e cb)
 
-parentProduce :: ActiveVar -> ActiveVar -> TMVar a -> Events a -> IO ()
-parentProduce activeVar parentActiveVar sourceVar ea =
-  finally
-    (runResM (guardedProduce activeVar ea (\a -> ActiveYes <$ putTMVar sourceVar a)))
-    (atomically (deactivateVar parentActiveVar))
+parentProduce :: ActiveVar -> ActiveVar -> TMVar a -> TVar Int -> Events a -> IO ()
+parentProduce activeVar parentActiveVar sourceVar genVar ea = finally prod clean
+ where
+  prod = runResM $ guardedProduce activeVar ea $ \a -> do
+    putTMVar sourceVar a
+    modifyTVar' genVar succ
+    pure ActiveYes
+  clean = atomically (deactivateVar parentActiveVar)
 
 instance Monad Events where
   return = pure
@@ -145,8 +148,11 @@ instance Monad Events where
     sourceVar <- liftIO newEmptyTMVarIO
     genVar <- liftIO (newTVarIO 0)
     scopedActive $ \activeVar -> do
-      void (spawnThread (parentProduce activeVar parentActiveVar sourceVar ea))
-      void (spawnThread (spawnChild activeVar parentActiveVar sourceVar genVar f cb))
+      void (spawnThread (parentProduce activeVar parentActiveVar sourceVar genVar ea))
+      spawnAsy <- spawnAsync (spawnChild activeVar parentActiveVar sourceVar genVar f cb)
+      -- Need to explicitly wait for the spawner thread to stop so there isn't a race
+      -- in checking the thread count ref for automatic termination
+      liftIO (wait spawnAsy)
 
 liftE :: IO a -> Events a
 liftE act = Events (\cb -> liftIO (act >>= atomically . void . cb))
@@ -200,9 +206,8 @@ zipWithE f ea eb = Events $ \cb -> do
   let cba = callZipWith f aVar bVar cb
       cbb = callZipWith (flip f) bVar aVar cb
   scopedActive $ \activeVar -> do
-    barrier <- liftIO (atomically (newBarrier 2 activeVar))
-    void (spawnThread (trackBarrier barrier (runResM (guardedProduce activeVar ea cba))))
-    void (spawnThread (trackBarrier barrier (runResM (guardedProduce activeVar eb cbb))))
+    void (spawnThread (runResM (guardedProduce activeVar ea cba)))
+    void (spawnThread (runResM (guardedProduce activeVar eb cbb)))
 
 zipE :: Events a -> Events b -> Events (a, b)
 zipE = zipWithE (,)
@@ -320,13 +325,11 @@ data HoldBehavior a = HoldBehavior
   }
   deriving stock (Functor)
 
--- applyWithH :: (a -> b -> c) -> HoldBehavior a -> HoldBehavior b -> HoldBehavior c
--- applyWithH f (HoldBehavior sa ea ra) (HoldBehavior sb eb rb) = HoldBehavior (f sa sb) (zipWithE f ea eb) rx
---  where
---   rx = maybe rb (\a -> maybe ra (Just . finally a) rb) ra
+applyWithH :: (a -> b -> c) -> HoldBehavior a -> HoldBehavior b -> HoldBehavior c
+applyWithH f (HoldBehavior sa ea) (HoldBehavior sb eb) = HoldBehavior (f sa sb) (zipWithE f ea eb)
 
--- applyH :: HoldBehavior (a -> b) -> HoldBehavior a -> HoldBehavior b
--- applyH = applyWithH ($)
+applyH :: HoldBehavior (a -> b) -> HoldBehavior a -> HoldBehavior b
+applyH = applyWithH ($)
 
 data MergeBehavior a where
   MergeBehavior :: (x -> y -> a) -> Behavior x -> Behavior y -> MergeBehavior a
@@ -374,9 +377,9 @@ data Ref a
 
 applyWithB :: (a -> b -> c) -> Behavior a -> Events b -> Events c
 applyWithB f b e = Events $ \cb -> do
-  scoped $ do
+  scopedActive $ \activeVar -> do
     r <- observeB b
-    produceE e (\x -> readR r >>= cb . flip f x)
+    guardedProduce activeVar e (\x -> readR r >>= cb . flip f x)
 
 applyB :: Behavior (a -> b) -> Events a -> Events b
 applyB = applyWithB ($)

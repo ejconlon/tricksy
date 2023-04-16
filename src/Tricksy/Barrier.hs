@@ -1,10 +1,11 @@
-module Tricksy.Barrier
-  ( Barrier
-  , newBarrier
-  , arriveBarrier
-  , trackBarrier
-  )
-where
+module Tricksy.Barrier () where
+
+--   ( Barrier
+--   , newBarrier
+--   , arriveBarrier
+--   , trackBarrier
+--   )
+-- where
 
 import Control.Concurrent.STM (STM, atomically)
 import Control.Concurrent.STM.TVar (TVar, newTVar, stateTVar)

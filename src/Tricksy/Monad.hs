@@ -18,12 +18,15 @@ where
 import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo)
 import Control.Concurrent.Async (Async (..), AsyncCancelled (..), async)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.STM (STM, atomically, retry)
+import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar)
 import Control.Exception (AsyncException, SomeAsyncException, SomeException, catch, throwIO)
-import Control.Monad (void, when)
+import Control.Monad (unless, void, when)
 import Control.Monad.Catch (Exception (fromException), MonadCatch, MonadMask (..), MonadThrow, try)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.IO.Unlift (MonadUnliftIO (..))
 import Control.Monad.Primitive (PrimMonad (..))
+import Control.Monad.Reader (ReaderT (..), asks)
 import Control.Monad.Trans.Resource (ResIO)
 import Control.Monad.Trans.Resource qualified as R
 import Data.Maybe (isNothing)
@@ -33,7 +36,12 @@ newtype ReraiseError = ReraiseError {unReraiseError :: SomeException}
 
 instance Exception ReraiseError
 
-newtype ResM a = ResM {unResM :: ResIO a}
+newtype ResEnv = ResEnv {reTcVar :: TVar Int}
+
+newResEnv :: IO ResEnv
+newResEnv = fmap ResEnv (newTVarIO 0)
+
+newtype ResM a = ResM {unResM :: ReaderT ResEnv ResIO a}
   deriving newtype
     ( Functor
     , Applicative
@@ -48,7 +56,7 @@ newtype ResM a = ResM {unResM :: ResIO a}
     )
 
 runResM :: ResM a -> IO a
-runResM = R.runResourceT . unResM
+runResM m = newResEnv >>= R.runResourceT . runReaderT (unResM m)
 
 allocate :: IO a -> (a -> IO ()) -> ResM a
 allocate mk free = ResM (fmap snd (R.allocate mk free))
@@ -59,8 +67,11 @@ allocate_ mk free = ResM (void (R.allocate_ mk free))
 register :: IO () -> ResM ()
 register free = ResM (void (R.register free))
 
-scoped :: ResM a -> ResM a
-scoped = liftIO . runResM
+scoped :: (STM () -> ResM a) -> ResM a
+scoped f = ResM $ do
+  tcVar <- asks reTcVar
+  let waitThreads = readTVar tcVar >>= \i -> unless (i == 0) retry
+  liftIO (runResM (f waitThreads))
 
 reraisable :: SomeException -> Bool
 reraisable err =
@@ -73,15 +84,17 @@ spawnWith k act = ResM $ mask $ \restore -> do
   pid <- liftIO myThreadId
   startVar <- liftIO newEmptyMVar
   endVar <- liftIO newEmptyMVar
-  (cid, b) <- liftIO $ k $ R.runResourceT $ do
+  tcVar <- asks reTcVar
+  liftIO (atomically (modifyTVar' tcVar succ))
+  (cid, b) <- liftIO $ k $ runResM $ ResM $ do
     liftIO (readMVar startVar)
     res <- try (restore (liftIO act))
-    liftIO (putMVar endVar ())
     case res of
       Right _ -> pure ()
       Left err -> when (reraisable err) (liftIO (throwTo pid (ReraiseError err)))
+    liftIO (putMVar endVar ())
     either (liftIO . throwIO) pure res
-  void (R.register (stopThread cid *> readMVar endVar))
+  void (R.register (stopThread cid *> readMVar endVar *> atomically (modifyTVar' tcVar pred)))
   liftIO (putMVar startVar ())
   pure b
 
