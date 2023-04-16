@@ -21,6 +21,11 @@ dependencies:
 - containers
 - async
 - stm
+- mtl
+- resourcet
+- unliftio-core
+- primitive
+- exceptions
 
 default-extensions:
 - BangPatterns

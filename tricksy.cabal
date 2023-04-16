@@ -29,8 +29,10 @@ library
       Tricksy
       Tricksy.Active
       Tricksy.ActiveScope
+      Tricksy.Barrier
       Tricksy.Cache
       Tricksy.Internal
+      Tricksy.Monad
       Tricksy.Scope
       Tricksy.Time
   other-modules:
@@ -68,7 +70,12 @@ library
     , base >=4.12 && <5
     , containers
     , deepseq
+    , exceptions
+    , mtl
+    , primitive
+    , resourcet
     , stm
+    , unliftio-core
   default-language: GHC2021
 
 test-suite tricksy-test
@@ -109,8 +116,13 @@ test-suite tricksy-test
     , base >=4.12 && <5
     , containers
     , deepseq
+    , exceptions
+    , mtl
+    , primitive
+    , resourcet
     , stm
     , tasty
     , tasty-hunit
     , tricksy
+    , unliftio-core
   default-language: GHC2021

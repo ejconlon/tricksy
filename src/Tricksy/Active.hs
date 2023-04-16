@@ -1,18 +1,19 @@
 module Tricksy.Active
   ( Active (..)
   , ActiveVar
+  , newActiveVar
   , newActiveVarIO
   , readActiveVar
   , readActiveVarIO
   , awaitActiveVar
-  , awaitActiveVarIO
   , deactivateVar
-  , deactivateVarIO
+  , trackActive
   )
 where
 
 import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM.TVar (TVar, newTVar, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (finally)
 import Control.Monad ((>=>))
 
 -- | Signal from consumers to producers
@@ -31,6 +32,9 @@ data Active = ActiveNo | ActiveYes
 
 newtype ActiveVar = ActiveVar {unActiveVar :: TVar Active}
 
+newActiveVar :: STM ActiveVar
+newActiveVar = fmap ActiveVar (newTVar ActiveYes)
+
 newActiveVarIO :: IO ActiveVar
 newActiveVarIO = fmap ActiveVar (newTVarIO ActiveYes)
 
@@ -43,11 +47,8 @@ readActiveVarIO = readTVarIO . unActiveVar
 awaitActiveVar :: ActiveVar -> STM ()
 awaitActiveVar = readActiveVar >=> \case ActiveYes -> retry; ActiveNo -> pure ()
 
-awaitActiveVarIO :: ActiveVar -> IO ()
-awaitActiveVarIO = atomically . awaitActiveVar
-
 deactivateVar :: ActiveVar -> STM ()
 deactivateVar = flip writeTVar ActiveNo . unActiveVar
 
-deactivateVarIO :: ActiveVar -> IO ()
-deactivateVarIO = atomically . deactivateVar
+trackActive :: ActiveVar -> IO a -> IO a
+trackActive activeVar act = finally act (atomically (deactivateVar activeVar))

@@ -1,13 +1,20 @@
 module Tricksy.ActiveScope
-  ( scopedActive
+  ( allocateActiveVar
+  , scopedActive
   )
 where
 
-import Control.Exception (finally)
-import Tricksy.Active (ActiveVar, deactivateVarIO, newActiveVarIO)
-import Tricksy.Scope (Scope, scoped)
+import Control.Concurrent.STM (atomically)
+import Control.Monad.IO.Class (liftIO)
+import Tricksy.Active (ActiveVar, awaitActiveVar, deactivateVar, newActiveVarIO)
+import Tricksy.Monad (ResM, allocate, scoped)
 
-scopedActive :: (forall s. ActiveVar -> Scope s -> IO a) -> IO a
-scopedActive f = do
-  activeVar <- newActiveVarIO
-  scoped (\scope -> finally (f activeVar scope) (deactivateVarIO activeVar))
+allocateActiveVar :: ResM ActiveVar
+allocateActiveVar = allocate newActiveVarIO (atomically . deactivateVar)
+
+scopedActive :: (ActiveVar -> ResM a) -> ResM a
+scopedActive f = scoped $ do
+  activeVar <- allocateActiveVar
+  a <- f activeVar
+  liftIO (atomically (awaitActiveVar activeVar))
+  pure a
