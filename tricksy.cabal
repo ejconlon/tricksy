@@ -33,7 +33,6 @@ library
       Tricksy.Cache
       Tricksy.Internal
       Tricksy.Monad
-      Tricksy.Scope
       Tricksy.Time
   other-modules:
       Paths_tricksy
