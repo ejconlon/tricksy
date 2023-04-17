@@ -4,7 +4,7 @@ import Control.Applicative (liftA2)
 import Control.Concurrent.Async (wait)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
-import Control.Concurrent.STM.TMVar (TMVar, putTMVar, tryTakeTMVar)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally)
 import Control.Monad (ap, void, when)
@@ -436,8 +436,8 @@ tickE = fmap snd . periodicE
 timerE :: TimeDelta -> Events TimeDelta
 timerE = mappendE . tickE
 
-consume :: ActiveVar -> TChan a -> (a -> IO Active) -> IO ()
-consume activeVar c f = go
+consumeIO :: ActiveVar -> TChan a -> (a -> IO Active) -> IO ()
+consumeIO activeVar c f = go
  where
   go = do
     ma <- atomically $ do
@@ -464,7 +464,7 @@ runE f e = do
   let sourceCb a = ActiveYes <$ writeTChan c a
   scopedActive $ \activeVar -> do
     void (spawnThread (trackActive activeVar (runResM (guardedProduce activeVar e sourceCb))))
-    asy <- spawnAsync (consume activeVar c f)
+    asy <- spawnAsync (consumeIO activeVar c f)
     liftIO (wait asy)
 
 -- | Creates an even stream from an IO action. Returning 'Nothing' ends the stream.
@@ -481,19 +481,16 @@ repeatMayE f = Events (liftIO . go)
           ActiveNo -> pure ()
           ActiveYes -> go cb
 
--- | Events from a (closable) channel
-channelE :: ActiveVar -> TChan a -> Events a
-channelE activeVar chanVar = Events (liftIO . go)
+guardedConsumeSTM :: ActiveVar -> STM a -> Events a
+guardedConsumeSTM activeVar act = Events (liftIO . go)
  where
   go cb = do
     active <- atomically $ do
       active <- readActiveVar activeVar
       case active of
-        ActiveNo -> do
-          deactivateVar activeVar
-          pure active
+        ActiveNo -> pure ActiveNo
         ActiveYes -> do
-          a <- readTChan chanVar
+          a <- act
           stillActive <- cb a
           case stillActive of
             ActiveNo -> deactivateVar activeVar
@@ -502,6 +499,14 @@ channelE activeVar chanVar = Events (liftIO . go)
     case active of
       ActiveNo -> pure ()
       ActiveYes -> go cb
+
+-- | Events from a channel
+channelE :: ActiveVar -> TChan a -> Events a
+channelE activeVar chanVar = guardedConsumeSTM activeVar (readTChan chanVar)
+
+-- | Events from a lock var
+lockE :: ActiveVar -> TMVar a -> Events a
+lockE activeVar lockVar = guardedConsumeSTM activeVar (takeTMVar lockVar)
 
 -- | Reads to EOF
 stdinE :: Events String

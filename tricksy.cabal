@@ -33,6 +33,7 @@ library
       Tricksy.Cache
       Tricksy.Internal
       Tricksy.Monad
+      Tricksy.Termbox
       Tricksy.Time
   other-modules:
       Paths_tricksy
@@ -74,6 +75,7 @@ library
     , primitive
     , resourcet
     , stm
+    , termbox
     , unliftio-core
   default-language: GHC2021
 
@@ -122,6 +124,7 @@ test-suite tricksy-test
     , stm
     , tasty
     , tasty-hunit
+    , termbox
     , tricksy
     , unliftio-core
   default-language: GHC2021
