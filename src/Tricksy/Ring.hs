@@ -10,12 +10,14 @@ module Tricksy.Ring
   , cursorRead
   , cursorAdvance
   , cursorAdvanceRead
+  , cursorConsume
   ) where
 
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, newTVar, readTVar, stateTVar, writeTVar, readTVarIO)
 import Control.Concurrent.STM (STM)
 import Data.Vector (Vector)
 import qualified Data.Vector as V
+import Data.Sequence (Seq)
 
 data Pos = Pos
   { posIndex :: !Int
@@ -60,7 +62,7 @@ newCursorIO r = fmap (Cursor r) (readTVarIO (ringHead r) >>= newTVarIO)
 newCursor :: Ring a -> STM (Cursor a)
 newCursor r = fmap (Cursor r) (readTVar (ringHead r) >>= newTVar)
 
-cursorRead :: Cursor a -> STM (Either Int a)
+cursorRead :: Cursor a -> STM (Maybe a)
 cursorRead (Cursor r hd) = undefined
 
 cursorAdvance :: Cursor a -> STM Int
@@ -68,3 +70,6 @@ cursorAdvance = undefined
 
 cursorAdvanceRead :: Cursor a -> STM (Int, a)
 cursorAdvanceRead = undefined
+
+cursorConsume :: Cursor a -> IO (Seq (Int, a))
+cursorConsume = undefined
