@@ -1,10 +1,9 @@
 module Tricksy.Internal where
 
 import Control.Applicative (liftA2)
-import Control.Concurrent.Async (wait)
-import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, retry)
-import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
-import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, orElse, retry)
+import Control.Concurrent.STM.TChan (TChan, newTChanIO, tryReadTChan, writeTChan)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally)
 import Control.Monad (ap, void, when)
@@ -17,7 +16,7 @@ import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..))
 import Tricksy.Cache (CacheHandler)
 import Tricksy.Control (Control (..), allocateControl, scopedControl, trackControl)
-import Tricksy.Monad (ResM, runResM, spawnAsync, spawnThread, stopThread)
+import Tricksy.Monad (ResM, runResM, spawnThread, stopThread)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 guarded :: Control -> STM () -> STM Active
@@ -86,66 +85,66 @@ sequentialE es = Events $ \c cb -> do
     [] -> pure ()
     z : zs -> produceE (z `andThenE` sequentialE zs) c cb
 
--- spawnChild :: ActiveVar -> ActiveVar -> TMVar a -> TVar Int -> (a -> Events b) -> (b -> STM Active) -> IO ()
--- spawnChild activeVar parentActiveVar sourceVar genVar f cb = runResM (go Nothing)
---  where
---   go mc = do
---     mz <- liftIO $ atomically $ do
---       active <- readActiveVar activeVar
---       case active of
---         ActiveNo -> pure Nothing
---         ActiveYes -> do
---           ma <- tryTakeTMVar sourceVar
---           case ma of
---             Nothing -> do
---               parentActive <- readActiveVar parentActiveVar
---               case parentActive of
---                 ActiveNo -> pure Nothing
---                 ActiveYes -> retry
---             Just a -> do
---               g <- readTVar genVar
---               pure (Just (a, g))
---     case mz of
---       Nothing -> pure ()
---       Just (a, g) -> do
---         case mc of
---           Just cid -> liftIO (stopThread cid)
---           Nothing -> pure ()
---         c <- spawnThread (childProduce activeVar genVar g (f a) cb)
---         go (Just c)
+genControl :: Control -> TVar Int -> Int -> Control
+genControl ctl genVar myGen = ctl {controlReadActive = rd, controlWait = wt}
+ where
+  rd = do
+    curGen <- readTVar genVar
+    if curGen == myGen
+      then controlReadActive ctl
+      else pure ActiveNo
+  wtg = do
+    curGen <- readTVar genVar
+    when (curGen == myGen) retry
+  wt = wtg `orElse` controlWait ctl
 
--- childProduce :: ActiveVar -> TVar Int -> Int -> Events b -> (b -> STM Active) -> IO ()
--- childProduce activeVar genVar myGen e cb =
---   let readIsMyGen = fmap (== myGen) (readTVar genVar)
---       readActive = do
---         isMyGen <- readIsMyGen
---         if isMyGen then readActiveVar activeVar else pure ActiveNo
---       deactivate = deactivateVar activeVar
---   in  runResM (rawGuardedProduce readActive deactivate e cb)
+spawnChild :: Control -> Control -> TMVar a -> TVar Int -> (a -> Events b) -> Callback STM b -> IO ()
+spawnChild prodCtl conCtl sourceVar genVar f cb = runResM (go Nothing)
+ where
+  go mc = do
+    mz <- liftIO $ atomically $ do
+      active <- controlReadActive conCtl
+      case active of
+        ActiveNo -> pure Nothing
+        ActiveYes -> do
+          ma <- tryTakeTMVar sourceVar
+          case ma of
+            Nothing -> do
+              parentActive <- controlReadActive prodCtl
+              case parentActive of
+                ActiveNo -> pure Nothing
+                ActiveYes -> retry
+            Just a -> do
+              g <- readTVar genVar
+              pure (Just (a, g))
+    case mz of
+      Nothing -> pure ()
+      Just (a, g) -> do
+        let e' = f a
+            ctl' = genControl conCtl genVar g
+        newCid <- spawnThread (runResM (produceE e' ctl' cb))
+        case mc of
+          Just oldCid -> liftIO (stopThread oldCid)
+          Nothing -> pure ()
+        go (Just newCid)
 
--- parentProduce :: ActiveVar -> ActiveVar -> TMVar a -> TVar Int -> Events a -> IO ()
--- parentProduce activeVar parentActiveVar sourceVar genVar ea = finally prod clean
---  where
---   prod = runResM $ guardedProduce activeVar ea $ \a -> do
---     putTMVar sourceVar a
---     modifyTVar' genVar succ
---     pure ActiveYes
---   clean = atomically (deactivateVar parentActiveVar)
+parentProduce :: Control -> Control -> TMVar a -> TVar Int -> Events a -> IO ()
+parentProduce prodCtl conCtl sourceVar genVar ea = finally prod clean
+ where
+  prod = runResM $ produceE ea conCtl $ \_ a -> do
+    putTMVar sourceVar a
+    modifyTVar' genVar succ
+  clean = atomically (controlDeactivate prodCtl)
 
 instance Monad Events where
   return = pure
-  (>>=) = undefined
-
---   ea >>= f = Events $ \c cb -> do
---     parentActiveVar <- liftIO newActiveVarIO
---     sourceVar <- liftIO newEmptyTMVarIO
---     genVar <- liftIO (newTVarIO 0)
---     scopedControl c $ do
---       void (spawnThread (parentProduce activeVar parentActiveVar sourceVar genVar ea))
---       spawnAsy <- spawnAsync (spawnChild activeVar parentActiveVar sourceVar genVar f cb)
---       -- Need to explicitly wait for the spawner thread to stop so there isn't a race
---       -- in checking the thread count ref for automatic termination
---       liftIO (wait spawnAsy)
+  ea >>= f = Events $ \conCtl cb -> do
+    prodCtl <- allocateControl
+    sourceVar <- liftIO newEmptyTMVarIO
+    genVar <- liftIO (newTVarIO 0)
+    scopedControl conCtl $ do
+      void (spawnThread (parentProduce prodCtl conCtl sourceVar genVar ea))
+      void (spawnThread (spawnChild prodCtl conCtl sourceVar genVar f cb))
 
 liftE :: IO a -> Events a
 liftE act = Events (\ctl cb -> liftIO (guardedIO_ ctl (act >>= atomically . guardedCall_ ctl cb)))
