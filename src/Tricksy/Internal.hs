@@ -138,13 +138,15 @@ parentProduce prodCtl conCtl sourceVar genVar ea = finally prod clean
 
 instance Monad Events where
   return = pure
-  ea >>= f = Events $ \conCtl cb -> do
-    prodCtl <- allocateControl
-    sourceVar <- liftIO newEmptyTMVarIO
-    genVar <- liftIO (newTVarIO 0)
+  ea >>= f = Events $ \conCtl cb ->
     scopedControl conCtl $ do
+      prodCtl <- allocateControl
+      sourceVar <- liftIO newEmptyTMVarIO
+      genVar <- liftIO (newTVarIO 0)
       void (spawnThread (parentProduce prodCtl conCtl sourceVar genVar ea))
       void (spawnThread (spawnChild prodCtl conCtl sourceVar genVar f cb))
+      --- XXX remove
+      liftIO (atomically (controlWait conCtl))
 
 liftE :: IO a -> Events a
 liftE act = Events (\ctl cb -> liftIO (guardedIO_ ctl (act >>= atomically . guardedCall_ ctl cb)))
@@ -458,11 +460,11 @@ consumeIO prodCtl conCtl chan f = go
 -- | Runs the callback on all events in the stream.
 runE :: Callback IO a -> Events a -> ResM ()
 runE f e = do
-  chan <- liftIO newTChanIO
-  let sourceCb = const (writeTChan chan)
-  prodCtl <- allocateControl
   conCtl <- allocateControl
   scopedControl conCtl $ do
+    prodCtl <- allocateControl
+    chan <- liftIO newTChanIO
+    let sourceCb = const (writeTChan chan)
     void (spawnThread (trackControl prodCtl (runResM (produceE e conCtl sourceCb))))
     void (spawnThread (consumeIO prodCtl conCtl chan f))
 

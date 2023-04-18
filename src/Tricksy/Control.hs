@@ -32,9 +32,8 @@ scopedControl ctl act = do
   active <- liftIO (atomically (controlReadActive ctl))
   case active of
     ActiveNo -> pure ()
-    ActiveYes -> scoped $ \waitThreads -> do
-      act
-      liftIO (atomically (controlWait ctl `orElse` waitThreads))
+    ActiveYes -> scoped $ \waitThreads ->
+      act *> liftIO (atomically (orElse (controlWait ctl) waitThreads))
 
 trackControl :: Control -> IO a -> IO a
 trackControl ctl act = finally act (atomically (controlDeactivate ctl))
