@@ -28,9 +28,9 @@ library
   exposed-modules:
       Tricksy
       Tricksy.Active
-      Tricksy.ActiveScope
       Tricksy.Barrier
       Tricksy.Cache
+      Tricksy.Control
       Tricksy.Internal
       Tricksy.Monad
       Tricksy.Termbox
