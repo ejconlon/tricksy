@@ -27,6 +27,7 @@ dependencies:
 - primitive
 - exceptions
 - termbox
+- vector
 
 default-extensions:
 - BangPatterns

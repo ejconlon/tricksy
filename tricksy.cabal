@@ -33,6 +33,7 @@ library
       Tricksy.Control
       Tricksy.Internal
       Tricksy.Monad
+      Tricksy.Ring
       Tricksy.Termbox
       Tricksy.Time
   other-modules:
@@ -77,6 +78,7 @@ library
     , stm
     , termbox
     , unliftio-core
+    , vector
   default-language: GHC2021
 
 test-suite tricksy-test
@@ -127,4 +129,5 @@ test-suite tricksy-test
     , termbox
     , tricksy
     , unliftio-core
+    , vector
   default-language: GHC2021
