@@ -2,7 +2,7 @@ module Tricksy.Internal where
 
 import Control.Applicative (liftA2)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, orElse, retry)
-import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
+import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally)
@@ -17,8 +17,8 @@ import Tricksy.Active (Active (..))
 import Tricksy.Cache (CacheHandler)
 import Tricksy.Control (Control (..), allocateControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, runResM, spawnThread, stopThread)
-import Tricksy.Ring (Ring, cursorAdvanceRead, newCursor)
-import Tricksy.Rw (Rw (..), chanRw)
+import Tricksy.Ring (Ring, cursorAdvance, newCursor, newRingIO)
+import Tricksy.Rw (Rw (..), chanRw, ringRw)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 guarded :: Control -> STM () -> STM Active
@@ -50,6 +50,9 @@ guardedCall ctl cb a = guarded ctl (cb ctl a)
 
 guardedCall_ :: Control -> Callback STM a -> a -> STM ()
 guardedCall_ ctl cb a = guarded_ ctl (cb ctl a)
+
+atomicCall :: Callback STM a -> Callback IO a
+atomicCall ctl cb a = atomically (ctl cb a)
 
 -- | Event producer - takes a consumer callback and pushes events through.
 newtype Events a = Events {produceE :: Control -> Callback STM a -> ResM ()}
@@ -449,23 +452,24 @@ consumeIO prodCtl conCtl rd f = go
       Just a -> f conCtl a *> go
 
 -- | Runs the callback on all events in the stream. Takes a function to
--- create a buffer, so you can choose how you want the producer and
+-- create a buffer strategy, so you can choose how you want the producer and
 -- consumer to interact.
-runRwE :: IO (Rw a b) -> Callback IO b -> Events a -> ResM ()
-runRwE mkRw f e = do
-  conCtl <- allocateControl
+internalRunE :: IO (Rw a b) -> Control -> Callback IO b -> Events a -> ResM ()
+internalRunE mkRw conCtl f e =
   scopedControl conCtl $ do
-    prodCtl <- allocateControl
     rw <- liftIO mkRw
+    prodCtl <- allocateControl
     let sourceCb = const (rwWrite rw)
         sinkFn = rwRead rw
     void (spawnThread (trackControl prodCtl (runResM (produceE e conCtl sourceCb))))
     void (spawnThread (consumeIO prodCtl conCtl sinkFn f))
 
--- | Runs the callback on all events in the stream. Uses a 'TChan' internally,
--- so beware unbounded buffering.
-runE :: Callback IO a -> Events a -> ResM ()
-runE = runRwE chanRw
+-- | Runs the callback on all events in the stream. Uses a ring buffer internally,
+-- so the callback will be informed of how many events are dropped
+rwRunE :: IO (Rw a b) -> Callback IO b -> Events a -> ResM ()
+rwRunE mkRw f e = do
+  conCtl <- allocateControl
+  internalRunE mkRw conCtl f e
 
 -- | Creates an even stream from an IO action. Returning 'Nothing' ends the stream.
 repeatMayE :: IO (Maybe a) -> Events a
@@ -499,21 +503,35 @@ lockE :: TMVar a -> Events a
 lockE lockVar = repeatTxnE (takeTMVar lockVar)
 
 -- | Events from a ring buffer
--- The first component of tuple is the number of events between invocations
--- (always positive). If the consumer keeps up with the producer, it will be 1.
+-- The first component of tuple is the number of dropped events between invocations
+-- (always non-negative). If the consumer keeps up with the producer, it will be 0.
 ringE :: Ring a -> Events (Int, a)
 ringE ring = Events (\ctl cb -> liftIO (goStart ctl cb))
  where
   goStart ctl cb = do
-    cur <- atomically (fmap fst (newCursor ring))
-    goRest ctl cb cur
+    mc <- atomically $ do
+      active <- controlReadActive ctl
+      case active of
+        ActiveNo -> pure Nothing
+        ActiveYes -> do
+          cur <- newCursor ring
+          p <- cursorAdvance cur
+          cb ctl p
+          pure (Just cur)
+    for_ mc (goRest ctl cb)
   goRest ctl cb cur = do
-    active <- atomically $ guarded ctl $ do
-      p@(n, _) <- cursorAdvanceRead cur
-      if n == 0 then retry else cb ctl p
+    active <- atomically (guarded ctl (cursorAdvance cur >>= cb ctl))
     case active of
       ActiveNo -> pure ()
       ActiveYes -> goRest ctl cb cur
+
+-- | Buffers the events stream using the given R/W strategy.
+rwBufferE :: IO (Rw a b) -> Events a -> Events b
+rwBufferE mkRw e = Events (\conCtl cb -> internalRunE mkRw conCtl (atomicCall cb) e)
+
+-- | Buffers the events stream using a ring buffer with the given capacity
+bufferE :: Int -> Events a -> Events (Int, a)
+bufferE cap = rwBufferE (newRingIO cap >>= atomically . ringRw)
 
 -- | Reads to EOF
 stdinE :: Events String
@@ -521,6 +539,6 @@ stdinE = repeatMayE (catchJust (\e -> if isEOFError e then Just () else Nothing)
 
 -- | Prints events with timestamps
 debugPrintE :: Show a => Events a -> IO ()
-debugPrintE e = runResM $ flip runE e $ \_ a -> do
+debugPrintE e = runResM $ flip (rwRunE (fmap chanRw newTChanIO)) e $ \_ a -> do
   m <- currentMonoTime
   print (m, a)

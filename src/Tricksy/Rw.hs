@@ -1,15 +1,17 @@
 module Tricksy.Rw
   ( Rw (..)
+  , varRw
   , chanRw
   , lockRw
   , ringRw
   )
 where
 
-import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Concurrent.STM.TChan (newTChanIO, readTChan, writeTChan)
-import Control.Concurrent.STM.TMVar (newEmptyTMVarIO, putTMVar, takeTMVar)
-import Tricksy.Ring (cursorAdvanceRead, newCursor, newRingIO, ringWrite)
+import Control.Concurrent.STM (STM)
+import Control.Concurrent.STM.TChan (TChan, readTChan, writeTChan)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar)
+import Control.Concurrent.STM.TVar (TVar, readTVar, writeTVar)
+import Tricksy.Ring (Ring, cursorAdvance, newCursor, ringWrite)
 
 -- | Interface abstracting over reading and writing to containers in STM.
 data Rw a b = Rw
@@ -18,22 +20,18 @@ data Rw a b = Rw
   }
   deriving (Functor)
 
-chanRw :: IO (Rw a a)
-chanRw = do
-  chan <- newTChanIO
-  pure (Rw (writeTChan chan) (readTChan chan))
+varRw :: TVar a -> Rw a a
+varRw var = Rw (writeTVar var) (readTVar var)
 
-lockRw :: IO (Rw a a)
-lockRw = do
-  lock <- newEmptyTMVarIO
-  pure (Rw (putTMVar lock) (takeTMVar lock))
+chanRw :: TChan a -> Rw a a
+chanRw chan = Rw (writeTChan chan) (readTChan chan)
 
-ringRw :: Int -> a -> IO (Rw a (Int, a))
-ringRw cap initVal = do
-  ring <- newRingIO cap initVal
-  cur <- atomically (fmap fst (newCursor ring))
+lockRw :: TMVar a -> Rw a a
+lockRw lock = Rw (putTMVar lock) (takeTMVar lock)
+
+ringRw :: Ring a -> STM (Rw a (Int, a))
+ringRw ring = do
+  cur <- newCursor ring
   let wr = ringWrite ring
-      rd = do
-        p@(i, _) <- cursorAdvanceRead cur
-        if i == 0 then retry else pure p
+      rd = cursorAdvance cur
   pure (Rw wr rd)

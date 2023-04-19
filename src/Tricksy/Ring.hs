@@ -6,11 +6,9 @@ module Tricksy.Ring
   , ringWrite
   , Cursor
   , newCursor
-  -- , newCursorIO
-  , cursorRead
+  , newCursorIO
   , cursorAdvance
-  , cursorAdvanceRead
-  , cursorConsume
+  , cursorFlush
   )
 where
 
@@ -47,32 +45,31 @@ data Cursor a = Cursor
   , cursorHead :: !(TVar Pos)
   }
 
-newRingIO :: Int -> a -> IO (Ring a)
-newRingIO cap val = Ring cap <$> V.generateM cap (const (newTVarIO val)) <*> newTVarIO initPos
+newRingIO :: Int -> IO (Ring a)
+newRingIO cap = Ring cap <$> V.generateM cap (const (newTVarIO undefined)) <*> newTVarIO initPos
 
-newRing :: Int -> a -> STM (Ring a)
-newRing cap val = Ring cap <$> V.generateM cap (const (newTVar val)) <*> newTVar initPos
+newRing :: Int -> STM (Ring a)
+newRing cap = Ring cap <$> V.generateM cap (const (newTVar undefined)) <*> newTVar initPos
 
 ringWrite :: Ring a -> a -> STM ()
 ringWrite (Ring cap buf hdVar) val = do
   ix <- stateTVar hdVar (\hd -> let hd'@(Pos ix _) = nextPos cap hd in (ix, hd'))
   writeTVar (buf V.! ix) val
 
-newCursor :: Ring a -> STM (Cursor a, a)
+newCursor :: Ring a -> STM (Cursor a)
 newCursor r = do
-  hd@(Pos ix _) <- readTVar (ringHead r)
+  hd <- readTVar (ringHead r)
   v <- newTVar hd
-  a <- readTVar (ringBuf r V.! ix)
-  pure (Cursor r v, a)
+  pure (Cursor r v)
 
-cursorRead :: Cursor a -> STM (Maybe a)
-cursorRead (Cursor r hd) = undefined
+newCursorIO :: Ring a -> IO (Cursor a)
+newCursorIO r = do
+  hd <- readTVarIO (ringHead r)
+  v <- newTVarIO hd
+  pure (Cursor r v)
 
-cursorAdvance :: Cursor a -> STM Int
+cursorAdvance :: Cursor a -> STM (Int, a)
 cursorAdvance = undefined
 
-cursorAdvanceRead :: Cursor a -> STM (Int, a)
-cursorAdvanceRead = undefined
-
-cursorConsume :: Cursor a -> IO (Seq (Int, a))
-cursorConsume = undefined
+cursorFlush :: Cursor a -> STM (Seq (Int, a))
+cursorFlush = undefined
