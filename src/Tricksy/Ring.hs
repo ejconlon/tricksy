@@ -6,23 +6,25 @@ module Tricksy.Ring
   , ringWrite
   , Cursor
   , newCursor
-  , newCursorIO
+  -- , newCursorIO
   , cursorRead
   , cursorAdvance
   , cursorAdvanceRead
   , cursorConsume
-  ) where
+  )
+where
 
-import Control.Concurrent.STM.TVar (TVar, newTVarIO, newTVar, readTVar, stateTVar, writeTVar, readTVarIO)
 import Control.Concurrent.STM (STM)
-import Data.Vector (Vector)
-import qualified Data.Vector as V
+import Control.Concurrent.STM.TVar (TVar, newTVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Data.Sequence (Seq)
+import Data.Vector (Vector)
+import Data.Vector qualified as V
 
 data Pos = Pos
   { posIndex :: !Int
   , posGen :: !Int
-  } deriving stock (Eq, Ord, Show)
+  }
+  deriving stock (Eq, Ord, Show)
 
 initPos :: Pos
 initPos = Pos 0 0
@@ -30,9 +32,9 @@ initPos = Pos 0 0
 nextPos :: Int -> Pos -> Pos
 nextPos cap (Pos ix gen) =
   let ix' = ix + 1
-  in if ix' == cap
-    then Pos 0 (gen + 1)
-    else Pos ix' gen
+  in  if ix' == cap
+        then Pos 0 (gen + 1)
+        else Pos ix' gen
 
 data Ring a = Ring
   { ringCap :: !Int
@@ -51,16 +53,17 @@ newRingIO cap val = Ring cap <$> V.generateM cap (const (newTVarIO val)) <*> new
 newRing :: Int -> a -> STM (Ring a)
 newRing cap val = Ring cap <$> V.generateM cap (const (newTVar val)) <*> newTVar initPos
 
-ringWrite :: a -> Ring a -> STM ()
-ringWrite val (Ring cap buf hdVar) = do
+ringWrite :: Ring a -> a -> STM ()
+ringWrite (Ring cap buf hdVar) val = do
   ix <- stateTVar hdVar (\hd -> let hd'@(Pos ix _) = nextPos cap hd in (ix, hd'))
   writeTVar (buf V.! ix) val
 
-newCursorIO :: Ring a -> IO (Cursor a)
-newCursorIO r = fmap (Cursor r) (readTVarIO (ringHead r) >>= newTVarIO)
-
-newCursor :: Ring a -> STM (Cursor a)
-newCursor r = fmap (Cursor r) (readTVar (ringHead r) >>= newTVar)
+newCursor :: Ring a -> STM (Cursor a, a)
+newCursor r = do
+  hd@(Pos ix _) <- readTVar (ringHead r)
+  v <- newTVar hd
+  a <- readTVar (ringBuf r V.! ix)
+  pure (Cursor r v, a)
 
 cursorRead :: Cursor a -> STM (Maybe a)
 cursorRead (Cursor r hd) = undefined

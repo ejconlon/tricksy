@@ -34,6 +34,7 @@ library
       Tricksy.Internal
       Tricksy.Monad
       Tricksy.Ring
+      Tricksy.Rw
       Tricksy.Termbox
       Tricksy.Time
   other-modules:

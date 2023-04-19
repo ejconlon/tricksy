@@ -3,9 +3,11 @@ module Tricksy.Control
   , allocateControl
   , scopedControl
   , trackControl
+  , linkControl
   )
 where
 
+import Control.Applicative (Applicative (..))
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (finally)
 import Control.Monad.IO.Class (liftIO)
@@ -35,5 +37,13 @@ scopedControl ctl act = do
     ActiveYes -> scoped $ \waitThreads ->
       act *> liftIO (atomically (orElse (controlWait ctl) waitThreads))
 
+-- | Deactivate the control when the action has finished
 trackControl :: Control -> IO a -> IO a
 trackControl ctl act = finally act (atomically (controlDeactivate ctl))
+
+-- | Link two control vars, but deactivate only the second when asked
+linkControl :: Control -> Control -> Control
+linkControl (Control a1 _ w1) (Control a2 d2 w2) = Control a d2 w
+ where
+  a = liftA2 (<>) a1 a2
+  w = orElse w1 w2

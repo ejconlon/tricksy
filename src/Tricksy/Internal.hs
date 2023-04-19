@@ -2,8 +2,8 @@ module Tricksy.Internal where
 
 import Control.Applicative (liftA2)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, orElse, retry)
-import Control.Concurrent.STM.TChan (TChan, newTChanIO, tryReadTChan, writeTChan)
-import Control.Concurrent.STM.TMVar (TMVar, putTMVar, tryTakeTMVar)
+import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan, tryReadTChan, writeTChan)
+import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust, finally)
 import Control.Monad (ap, void, when)
@@ -17,6 +17,8 @@ import Tricksy.Active (Active (..))
 import Tricksy.Cache (CacheHandler)
 import Tricksy.Control (Control (..), allocateControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, runResM, spawnThread, stopThread)
+import Tricksy.Ring (Ring, cursorAdvanceRead, newCursor)
+import Tricksy.Rw (Rw (..), chanRw)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 guarded :: Control -> STM () -> STM Active
@@ -180,8 +182,8 @@ capSnoc cap v a =
     s@(_ :<| t) -> (if Seq.length s >= cap then t else s) :|> a
 
 -- | Fulfills the role of fix
-bufferE :: Int -> (STM (Seq a) -> Events a) -> Events a
-bufferE cap f = Events $ \ctl cb -> do
+fixE :: Int -> (STM (Seq a) -> Events a) -> Events a
+fixE cap f = Events $ \ctl cb -> do
   aVar <- liftIO (newTVarIO Seq.empty)
   produceE (f (readTVar aVar)) ctl (\d a -> capSnoc cap aVar a *> cb d a)
 
@@ -433,40 +435,37 @@ tickE = fmap snd . periodicE
 timerE :: TimeDelta -> Events TimeDelta
 timerE = mappendE . tickE
 
-consumeIO :: Control -> Control -> TChan a -> Callback IO a -> IO ()
-consumeIO prodCtl conCtl chan f = go
+consumeIO :: Control -> Control -> STM a -> Callback IO a -> IO ()
+consumeIO prodCtl conCtl rd f = go
  where
   go = do
     ma <- atomically $ do
-      -- First check if consumer is done
       conActive <- controlReadActive conCtl
       case conActive of
         ActiveNo -> pure Nothing
-        ActiveYes -> do
-          -- Try to read next item from chan
-          ma <- tryReadTChan chan
-          case ma of
-            Just _ -> pure ma
-            Nothing -> do
-              -- If nothing, wait only if prod is active
-              prodActive <- controlReadActive prodCtl
-              case prodActive of
-                ActiveNo -> pure Nothing
-                ActiveYes -> retry
+        ActiveYes -> orElse (fmap Just rd) (Nothing <$ controlWait prodCtl)
     case ma of
       Nothing -> pure ()
       Just a -> f conCtl a *> go
 
--- | Runs the callback on all events in the stream.
-runE :: Callback IO a -> Events a -> ResM ()
-runE f e = do
+-- | Runs the callback on all events in the stream. Takes a function to
+-- create a buffer, so you can choose how you want the producer and
+-- consumer to interact.
+runRwE :: IO (Rw a b) -> Callback IO b -> Events a -> ResM ()
+runRwE mkRw f e = do
   conCtl <- allocateControl
   scopedControl conCtl $ do
     prodCtl <- allocateControl
-    chan <- liftIO newTChanIO
-    let sourceCb = const (writeTChan chan)
+    rw <- liftIO mkRw
+    let sourceCb = const (rwWrite rw)
+        sinkFn = rwRead rw
     void (spawnThread (trackControl prodCtl (runResM (produceE e conCtl sourceCb))))
-    void (spawnThread (consumeIO prodCtl conCtl chan f))
+    void (spawnThread (consumeIO prodCtl conCtl sinkFn f))
+
+-- | Runs the callback on all events in the stream. Uses a 'TChan' internally,
+-- so beware unbounded buffering.
+runE :: Callback IO a -> Events a -> ResM ()
+runE = runRwE chanRw
 
 -- | Creates an even stream from an IO action. Returning 'Nothing' ends the stream.
 repeatMayE :: IO (Maybe a) -> Events a
@@ -482,33 +481,39 @@ repeatMayE f = Events (\ctl cb -> liftIO (guardedIO_ ctl (go ctl cb)))
           ActiveNo -> pure ()
           ActiveYes -> go ctl cb
 
-repeatTxnE :: STM (Maybe a) -> Events a
+repeatTxnE :: STM a -> Events a
 repeatTxnE act = Events (\ctl cb -> liftIO (go ctl cb))
  where
   go ctl cb = do
-    active <- atomically (guarded ctl (act >>= maybe (pure ()) (cb ctl)))
+    active <- atomically (guarded ctl (act >>= cb ctl))
     case active of
       ActiveNo -> pure ()
       ActiveYes -> go ctl cb
 
-retryControl :: Control -> STM (Maybe a) -> STM (Maybe a)
-retryControl ctl act = do
-  ma <- act
-  case ma of
-    Nothing -> do
-      active <- controlReadActive ctl
-      case active of
-        ActiveNo -> pure ma
-        ActiveYes -> retry
-    Just _ -> pure ma
-
 -- | Events from a channel
-channelE :: Control -> TChan a -> Events a
-channelE prodCtl chanVar = repeatTxnE (retryControl prodCtl (tryReadTChan chanVar))
+channelE :: TChan a -> Events a
+channelE chanVar = repeatTxnE (readTChan chanVar)
 
 -- | Events from a lock var
-lockE :: Control -> TMVar a -> Events a
-lockE prodCtl lockVar = repeatTxnE (retryControl prodCtl (tryTakeTMVar lockVar))
+lockE :: TMVar a -> Events a
+lockE lockVar = repeatTxnE (takeTMVar lockVar)
+
+-- | Events from a ring buffer
+-- The first component of tuple is the number of events between invocations
+-- (always positive). If the consumer keeps up with the producer, it will be 1.
+ringE :: Ring a -> Events (Int, a)
+ringE ring = Events (\ctl cb -> liftIO (goStart ctl cb))
+ where
+  goStart ctl cb = do
+    cur <- atomically (fmap fst (newCursor ring))
+    goRest ctl cb cur
+  goRest ctl cb cur = do
+    active <- atomically $ guarded ctl $ do
+      p@(n, _) <- cursorAdvanceRead cur
+      if n == 0 then retry else cb ctl p
+    case active of
+      ActiveNo -> pure ()
+      ActiveYes -> goRest ctl cb cur
 
 -- | Reads to EOF
 stdinE :: Events String
