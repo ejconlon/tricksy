@@ -8,19 +8,17 @@ module Tricksy.Ring
   , newCursor
   , newCursorIO
   , cursorAdvance
-  , cursorFlush
   )
 where
 
-import Control.Concurrent.STM (STM)
+import Control.Concurrent.STM (STM, retry)
 import Control.Concurrent.STM.TVar (TVar, newTVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
-import Data.Sequence (Seq)
 import Data.Vector (Vector)
 import Data.Vector qualified as V
 
 data Pos = Pos
-  { posIndex :: !Int
-  , posGen :: !Int
+  { posGen :: !Int
+  , posIndex :: !Int
   }
   deriving stock (Eq, Ord, Show)
 
@@ -28,48 +26,69 @@ initPos :: Pos
 initPos = Pos 0 0
 
 nextPos :: Int -> Pos -> Pos
-nextPos cap (Pos ix gen) =
+nextPos cap (Pos gen ix) =
   let ix' = ix + 1
   in  if ix' == cap
-        then Pos 0 (gen + 1)
-        else Pos ix' gen
+        then Pos (gen + 1) 0
+        else Pos gen ix'
+
+readLimit :: Pos -> Maybe Pos
+readLimit (Pos gen ix) = do
+  if gen == 0
+    then if ix == 0 then Nothing else Just (Pos 0 0)
+    else Just (Pos (gen - 1) ix)
+
+elemDiff :: Int -> Pos -> Pos -> Int
+elemDiff cap (Pos endGen endIx) (Pos startGen startIx) =
+  cap * (endGen - startGen) + endIx - startIx
 
 data Ring a = Ring
   { ringCap :: !Int
   , ringBuf :: !(Vector (TVar a))
-  , ringHead :: !(TVar Pos)
+  , ringWriteHead :: !(TVar Pos)
   }
 
 data Cursor a = Cursor
   { cursorRing :: !(Ring a)
-  , cursorHead :: !(TVar Pos)
+  , cursorReadHead :: !(TVar Pos)
   }
 
+uninit :: a
+uninit = error "Evaluated uninitialized ring element"
+
 newRingIO :: Int -> IO (Ring a)
-newRingIO cap = Ring cap <$> V.generateM cap (const (newTVarIO undefined)) <*> newTVarIO initPos
+newRingIO cap = Ring cap <$> V.generateM cap (const (newTVarIO uninit)) <*> newTVarIO initPos
 
 newRing :: Int -> STM (Ring a)
-newRing cap = Ring cap <$> V.generateM cap (const (newTVar undefined)) <*> newTVar initPos
+newRing cap = Ring cap <$> V.generateM cap (const (newTVar uninit)) <*> newTVar initPos
 
 ringWrite :: Ring a -> a -> STM ()
-ringWrite (Ring cap buf hdVar) val = do
-  ix <- stateTVar hdVar (\hd -> let hd'@(Pos ix _) = nextPos cap hd in (ix, hd'))
+ringWrite (Ring cap buf hdVar) !val = do
+  ix <- stateTVar hdVar (\hd -> let hd'@(Pos _ ix) = nextPos cap hd in (ix, hd'))
   writeTVar (buf V.! ix) val
 
 newCursor :: Ring a -> STM (Cursor a)
 newCursor r = do
-  hd <- readTVar (ringHead r)
-  v <- newTVar hd
+  h <- readTVar (ringWriteHead r)
+  v <- newTVar h
   pure (Cursor r v)
 
 newCursorIO :: Ring a -> IO (Cursor a)
 newCursorIO r = do
-  hd <- readTVarIO (ringHead r)
-  v <- newTVarIO hd
+  h <- readTVarIO (ringWriteHead r)
+  v <- newTVarIO h
   pure (Cursor r v)
 
 cursorAdvance :: Cursor a -> STM (Int, a)
-cursorAdvance = undefined
-
-cursorFlush :: Cursor a -> STM (Seq (Int, a))
-cursorFlush = undefined
+cursorAdvance (Cursor r rhVar) = do
+  rh <- readTVar rhVar
+  wh <- readTVar (ringWriteHead r)
+  if rh == wh
+    then retry
+    else case readLimit wh of
+      Nothing -> retry
+      Just rl -> do
+        let (dropped, used) = if rh >= rl then (0, rh) else (elemDiff (ringCap r) rl rh, rl)
+            !next = nextPos (ringCap r) used
+        writeTVar rhVar next
+        fmap (dropped,) (readTVar (ringBuf r V.! posIndex used))

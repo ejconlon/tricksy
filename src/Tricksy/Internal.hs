@@ -451,11 +451,8 @@ consumeIO prodCtl conCtl rd f = go
       Nothing -> pure ()
       Just a -> f conCtl a *> go
 
--- | Runs the callback on all events in the stream. Takes a function to
--- create a buffer strategy, so you can choose how you want the producer and
--- consumer to interact.
-internalRunE :: IO (Rw a b) -> Control -> Callback IO b -> Events a -> ResM ()
-internalRunE mkRw conCtl f e =
+internalRwRunE :: IO (Rw a b) -> Control -> Callback IO b -> Events a -> ResM ()
+internalRwRunE mkRw conCtl f e =
   scopedControl conCtl $ do
     rw <- liftIO mkRw
     prodCtl <- allocateControl
@@ -464,14 +461,21 @@ internalRunE mkRw conCtl f e =
     void (spawnThread (trackControl prodCtl (runResM (produceE e conCtl sourceCb))))
     void (spawnThread (consumeIO prodCtl conCtl sinkFn f))
 
--- | Runs the callback on all events in the stream. Uses a ring buffer internally,
--- so the callback will be informed of how many events are dropped
+-- | Runs the callback on all events in the stream. Takes a function to
+-- create a buffer strategy, so you can choose how you want the producer and
+-- consumer to interact.
 rwRunE :: IO (Rw a b) -> Callback IO b -> Events a -> ResM ()
 rwRunE mkRw f e = do
   conCtl <- allocateControl
-  internalRunE mkRw conCtl f e
+  internalRwRunE mkRw conCtl f e
 
--- | Creates an even stream from an IO action. Returning 'Nothing' ends the stream.
+-- | Runs the callback on all events in the stream. Uses a ring buffer to
+-- maintain constant space during consumption, so the callback is informed of
+-- number of dropped events.
+ringRunE :: Int -> Callback IO (Int, a) -> Events a -> ResM ()
+ringRunE cap = rwRunE (newRingIO cap >>= ringRwIO)
+
+-- | Creates an event stream from an IO action. Returning 'Nothing' ends the stream.
 repeatMayE :: IO (Maybe a) -> Events a
 repeatMayE f = Events (\ctl cb -> liftIO (guardedIO_ ctl (go ctl cb)))
  where
@@ -527,11 +531,12 @@ ringE ring = Events (\ctl cb -> liftIO (goStart ctl cb))
 
 -- | Buffers the events stream using the given R/W strategy.
 rwBufferE :: IO (Rw a b) -> Events a -> Events b
-rwBufferE mkRw e = Events (\conCtl cb -> internalRunE mkRw conCtl (atomicCall cb) e)
+rwBufferE mkRw e = Events (\ctl cb -> internalRwRunE mkRw ctl (atomicCall cb) e)
 
--- | Buffers the events stream using a ring buffer with the given capacity
-bufferE :: Int -> Events a -> Events (Int, a)
-bufferE cap = rwBufferE (newRingIO cap >>= ringRwIO)
+-- | Buffers the events stream using a ring buffer with the given capacity.
+-- Dropped event counts are added to the stream.
+ringBufferE :: Int -> Events a -> Events (Int, a)
+ringBufferE cap = rwBufferE (newRingIO cap >>= ringRwIO)
 
 -- | Reads to EOF
 stdinE :: Events String
