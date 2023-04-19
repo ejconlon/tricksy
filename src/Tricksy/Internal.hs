@@ -18,7 +18,7 @@ import Tricksy.Cache (CacheHandler)
 import Tricksy.Control (Control (..), allocateControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, runResM, spawnThread, stopThread)
 import Tricksy.Ring (Ring, cursorAdvance, newCursor, newRingIO)
-import Tricksy.Rw (Rw (..), chanRw, ringRw)
+import Tricksy.Rw (Rw (..), chanRw, ringRwIO)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 guarded :: Control -> STM () -> STM Active
@@ -531,7 +531,7 @@ rwBufferE mkRw e = Events (\conCtl cb -> internalRunE mkRw conCtl (atomicCall cb
 
 -- | Buffers the events stream using a ring buffer with the given capacity
 bufferE :: Int -> Events a -> Events (Int, a)
-bufferE cap = rwBufferE (newRingIO cap >>= atomically . ringRw)
+bufferE cap = rwBufferE (newRingIO cap >>= ringRwIO)
 
 -- | Reads to EOF
 stdinE :: Events String
