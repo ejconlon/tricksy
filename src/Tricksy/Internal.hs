@@ -5,7 +5,7 @@ import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, or
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
 import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
-import Control.Exception (catchJust, finally)
+import Control.Exception (catchJust)
 import Control.Monad (ap, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
@@ -14,9 +14,9 @@ import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..))
-import Tricksy.Cache (CacheHandler)
-import Tricksy.Control (Control (..), allocateControl, scopedControl, trackControl)
-import Tricksy.Monad (ResM, runResM, spawnThread, stopThread)
+import Tricksy.Cache (CacheHandler, runCache)
+import Tricksy.Control (Control (..), allocateControl, newControl, scopedControl, trackControl)
+import Tricksy.Monad (ResM, finallyRegister, runResM, spawnThread, stopThread)
 import Tricksy.Ring (Ring, cursorAdvance, newCursor, newRingIO)
 import Tricksy.Rw (Rw (..), chanRw, ringRwIO)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
@@ -134,12 +134,10 @@ spawnChild prodCtl conCtl sourceVar genVar f cb = runResM (go Nothing)
         go (Just newCid)
 
 parentProduce :: Control -> Control -> TMVar a -> TVar Int -> Events a -> IO ()
-parentProduce prodCtl conCtl sourceVar genVar ea = finally prod clean
- where
-  prod = runResM $ produceE ea conCtl $ \_ a -> do
+parentProduce prodCtl conCtl sourceVar genVar ea =
+  trackControl prodCtl $ runResM $ produceE ea conCtl $ \_ a -> do
     putTMVar sourceVar a
     modifyTVar' genVar succ
-  clean = atomically (controlDeactivate prodCtl)
 
 instance Monad Events where
   return = pure
@@ -150,8 +148,6 @@ instance Monad Events where
       genVar <- liftIO (newTVarIO 0)
       void (spawnThread (parentProduce prodCtl conCtl sourceVar genVar ea))
       void (spawnThread (spawnChild prodCtl conCtl sourceVar genVar f cb))
-      --- XXX remove
-      liftIO (atomically (controlWait conCtl))
 
 liftE :: IO a -> Events a
 liftE act = Events (\ctl cb -> liftIO (guardedIO_ ctl (act >>= atomically . guardedCall_ ctl cb)))
@@ -160,8 +156,8 @@ repeatE :: IO a -> Events a
 repeatE act = Events (\ctl cb -> liftIO (guardedIO_ ctl (go ctl cb)))
  where
   go ctl cb = do
-    a <- liftIO act
-    active <- liftIO (atomically (guardedCall ctl cb a))
+    a <- act
+    active <- atomically (guardedCall ctl cb a)
     case active of
       ActiveNo -> pure ()
       ActiveYes -> go ctl cb
@@ -184,34 +180,11 @@ capSnoc cap v a =
     Empty -> Empty :|> a
     s@(_ :<| t) -> (if Seq.length s >= cap then t else s) :|> a
 
--- | Fulfills the role of fix
+-- | Fulfills the role of fix... to a certain extent
 fixE :: Int -> (STM (Seq a) -> Events a) -> Events a
 fixE cap f = Events $ \ctl cb -> do
   aVar <- liftIO (newTVarIO Seq.empty)
   produceE (f (readTVar aVar)) ctl (\d a -> capSnoc cap aVar a *> cb d a)
-
-callZipWith :: (a -> b -> c) -> TVar (Maybe a) -> TVar (Maybe b) -> Callback STM c -> Callback STM a
-callZipWith f aVar bVar cb ctl = guardedCall_ ctl $ \ctl' a -> do
-  void (writeTVar aVar (Just a))
-  mb <- readTVar bVar
-  case mb of
-    Nothing -> pure ()
-    Just b -> cb ctl' (f a b)
-
-zipWithE :: (a -> b -> c) -> Events a -> Events b -> Events c
-zipWithE f ea eb = Events $ \ctl cb -> do
-  aVar <- liftIO (newTVarIO Nothing)
-  bVar <- liftIO (newTVarIO Nothing)
-  let cba = callZipWith f aVar bVar cb
-      cbb = callZipWith (flip f) bVar aVar cb
-  scopedControl ctl $ do
-    void (spawnThread (runResM (produceE ea ctl cba)))
-    void (spawnThread (runResM (produceE eb ctl cbb)))
-
--- TODO work out termination
-
-zipE :: Events a -> Events b -> Events (a, b)
-zipE = zipWithE (,)
 
 unfoldE :: (s -> Maybe (a, s)) -> s -> Events a
 unfoldE f s0 = Events (\ctl cb -> liftIO (newTVarIO s0 >>= go ctl cb))
@@ -309,28 +282,17 @@ cycleE fa = Events (\ctl cb -> let as0 = toList fa in case as0 of [] -> pure ();
           ActiveNo -> pure ()
           ActiveYes -> go as0 as' ctl cb
 
-data CacheBehaviorSpec a where
-  CacheBehaviorSpec :: !TimeDelta -> !(CacheHandler z a) -> !(IO z) -> CacheBehaviorSpec a
-
-instance Functor CacheBehaviorSpec where
-  fmap f (CacheBehaviorSpec ttl han act) = CacheBehaviorSpec ttl (fmap f . han) act
-
-newtype CacheBehavior a = CacheBehavior {unCacheBehavior :: ResM (CacheBehaviorSpec a)}
+data CacheBehavior a where
+  CacheBehavior :: !TimeDelta -> !(CacheHandler z a) -> !(IO z) -> CacheBehavior a
 
 instance Functor CacheBehavior where
-  fmap f = CacheBehavior . fmap (fmap f) . unCacheBehavior
+  fmap f (CacheBehavior ttl han act) = CacheBehavior ttl (fmap f . han) act
 
 data HoldBehavior a = HoldBehavior
   { hbStart :: !a
   , hbEvents :: !(Events a)
   }
   deriving stock (Functor)
-
-applyWithH :: (a -> b -> c) -> HoldBehavior a -> HoldBehavior b -> HoldBehavior c
-applyWithH f (HoldBehavior sa ea) (HoldBehavior sb eb) = HoldBehavior (f sa sb) (zipWithE f ea eb)
-
-applyH :: HoldBehavior (a -> b) -> HoldBehavior a -> HoldBehavior b
-applyH = applyWithH ($)
 
 data MergeBehavior a where
   MergeBehavior :: (x -> y -> a) -> Behavior x -> Behavior y -> MergeBehavior a
@@ -342,7 +304,8 @@ data Behavior a
   = BehaviorPure !a
   | BehaviorCache !(CacheBehavior a)
   | BehaviorHold !(HoldBehavior a)
-  | BehaviorMerge (MergeBehavior a)
+  | BehaviorMerge !(MergeBehavior a)
+  | BehaviorRes !(ResM (Behavior a))
   deriving stock (Functor)
 
 instance Applicative Behavior where
@@ -350,7 +313,7 @@ instance Applicative Behavior where
   liftA2 f bx by = BehaviorMerge (MergeBehavior f bx by)
 
 cacheB :: TimeDelta -> CacheHandler z a -> IO z -> Behavior a
-cacheB ttl han act = BehaviorCache (CacheBehavior (pure (CacheBehaviorSpec ttl han act)))
+cacheB ttl han act = BehaviorCache (CacheBehavior ttl han act)
 
 explicitCacheB :: CacheBehavior a -> Behavior a
 explicitCacheB = BehaviorCache
@@ -361,50 +324,55 @@ holdB start e = BehaviorHold (HoldBehavior start e)
 explicitHoldB :: HoldBehavior a -> Behavior a
 explicitHoldB = BehaviorHold
 
-data CacheRef a = CacheRef
-  { crControl :: !Control
-  , crAction :: !(STM a)
+resB :: ResM (Behavior a) -> Behavior a
+resB = BehaviorRes
+
+newtype CacheRef a = CacheRef
+  { crAction :: STM a
   }
 
-data HoldRef a = HoldRef
-  { hrControl :: !Control
-  , hrCurVar :: !(TVar a)
+newtype HoldRef a = HoldRef
+  { hrCurVar :: TVar a
   }
 
-data Ref a
-  = RefPure !a
-  | RefCache !(CacheRef a)
-  | RefHold !(HoldRef a)
-
-applyWithB :: (a -> b -> c) -> Behavior a -> Events b -> Events c
+applyWithB :: (a -> b -> STM c) -> Behavior a -> Events b -> Events c
 applyWithB f b e = Events $ \ctl cb -> do
   scopedControl ctl $ do
     r <- observeB b
-    produceE e ctl (\d x -> readR r >>= cb d . flip f x)
+    produceE e ctl (\d x -> r >>= flip f x >>= cb d)
 
-applyB :: Behavior (a -> b) -> Events a -> Events b
-applyB = applyWithB ($)
+spawnCacheB :: CacheBehavior a -> ResM (STM a)
+spawnCacheB (CacheBehavior ttl han act) = runCache ttl han act
 
-observeB :: Behavior a -> ResM (Ref a)
-observeB = res
- where
-  res = \case
-    BehaviorPure a -> pure (RefPure a)
-    BehaviorCache _ -> error "TODO"
-    BehaviorHold (HoldBehavior start e) -> do
-      ctl <- allocateControl
-      curVar <- liftIO (newTVarIO start)
-      void $
-        spawnThread $
-          runResM (produceE e ctl (\_ a -> writeTVar curVar a))
-      pure (RefHold (HoldRef ctl curVar))
-    BehaviorMerge {} -> error "TODO"
+spawnHoldB :: HoldBehavior a -> ResM (STM a)
+spawnHoldB (HoldBehavior start e) = do
+  ctl <- newControl
+  curVar <- liftIO (newTVarIO start)
+  finallyRegister
+    (void (spawnThread (runResM (produceE e ctl (\_ a -> writeTVar curVar a)))))
+    (atomically (controlDeactivate ctl))
+  pure (readTVar curVar)
 
-readR :: Ref a -> STM a
-readR = \case
-  RefPure a -> pure a
-  RefCache _ -> error "TODO"
-  RefHold (HoldRef _ curVar) -> readTVar curVar
+spawnMergeB :: MergeBehavior a -> ResM (STM a)
+spawnMergeB (MergeBehavior f b1 b2) =
+  case b1 of
+    BehaviorPure x -> observeB (fmap (f x) b2)
+    BehaviorRes mb -> mb >>= \bx -> spawnMergeB (MergeBehavior f bx b2)
+    _ -> case b2 of
+      BehaviorPure x -> observeB (fmap (`f` x) b1)
+      BehaviorRes mb -> mb >>= \bx -> spawnMergeB (MergeBehavior f b1 bx)
+      _ -> do
+        r1 <- observeB b1
+        r2 <- observeB b2
+        pure (liftA2 f r1 r2)
+
+observeB :: Behavior a -> ResM (STM a)
+observeB = \case
+  BehaviorPure a -> pure (pure a)
+  BehaviorCache cb -> spawnCacheB cb
+  BehaviorHold hb -> spawnHoldB hb
+  BehaviorMerge mb -> spawnMergeB mb
+  BehaviorRes rb -> rb >>= observeB
 
 -- | Delays the event stream by some 'TimeDelta'.
 -- The delay will happen on the consuming thread.

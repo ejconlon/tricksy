@@ -1,26 +1,51 @@
 module Tricksy.Cache
   ( CacheHandler
   , defaultCacheHandler
+  , runCache
   )
 where
 
-import Control.Concurrent.STM (STM, throwSTM)
+import Control.Concurrent.STM (STM, atomically, throwSTM)
+import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO)
 import Control.Exception (SomeException)
+import Control.Monad (void)
+import Control.Monad.IO.Class (liftIO)
+import Tricksy.Control (Control (..), newControl)
+import Tricksy.Monad (ResM, finallyRegister, spawnThread)
+import Tricksy.Time (MonoTime, TimeDelta)
 
 type CacheHandler z a = Maybe (Either SomeException z) -> STM a
 
 defaultCacheHandler :: a -> CacheHandler a a
 defaultCacheHandler a = maybe (pure a) (either throwSTM pure)
 
--- data CacheStatus = CacheStatusOpen | CacheStatusClosing | CacheStatusClosed
---   deriving stock (Eq, Ord, Show, Enum, Bounded)
+data CacheEnv z a = CacheEnv
+  { ceControl :: !Control
+  , ceTtl :: !TimeDelta
+  , ceHandler :: !(CacheHandler z a)
+  , ceAction :: !(IO z)
+  , ceReq :: !(TMVar (CacheReq z))
+  }
 
--- data CacheState z = CacheState
---   { csStatus :: !CacheStatus
---   , csTime :: !(Maybe MonoTime)
---   , csActiveVar :: !ActiveVar
---   , csResVar :: !(TMVar (Either SomeException z))
---   }
+data CacheReq z = CacheReq
+  { crTime :: !MonoTime
+  , crRes :: !(TMVar (Either SomeException z))
+  }
+
+cacheRequest :: CacheEnv z a -> STM a
+cacheRequest = undefined
+
+cacheThread :: CacheEnv z a -> IO ()
+cacheThread = undefined
+
+runCache :: TimeDelta -> CacheHandler z a -> IO z -> ResM (STM a)
+runCache ttl han act = do
+  ctl <- newControl
+  ce <- liftIO (CacheEnv ctl ttl han act <$> newEmptyTMVarIO)
+  finallyRegister
+    (void (spawnThread (cacheThread ce)))
+    (atomically (controlDeactivate ctl))
+  pure (cacheRequest ce)
 
 -- data Cache s a where
 --   Cache :: !(Scope s) -> !TimeDelta -> !(CacheHandler z a) -> !(IO z) -> !(MVar (CacheState z)) -> Cache s a

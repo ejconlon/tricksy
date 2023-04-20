@@ -1,5 +1,6 @@
 module Tricksy.Control
   ( Control (..)
+  , newControl
   , allocateControl
   , scopedControl
   , trackControl
@@ -25,6 +26,9 @@ activeVarControl v = Control (readActiveVar v) (deactivateVar v) (waitActiveVar 
 
 allocateActiveVar :: ResM ActiveVar
 allocateActiveVar = allocate newActiveVarIO (atomically . deactivateVar)
+
+newControl :: ResM Control
+newControl = liftIO (fmap activeVarControl newActiveVarIO)
 
 allocateControl :: ResM Control
 allocateControl = fmap activeVarControl allocateActiveVar

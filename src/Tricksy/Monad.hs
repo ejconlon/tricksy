@@ -8,6 +8,7 @@ module Tricksy.Monad
   , allocate
   , allocate_
   , register
+  , finallyRegister
   , scoped
   , spawnThread
   , spawnAsync
@@ -24,7 +25,7 @@ import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, takeTMVar
 import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.Exception (AsyncException, SomeAsyncException, SomeException, catch, throwIO)
 import Control.Monad (unless, void, when)
-import Control.Monad.Catch (Exception (fromException), MonadCatch, MonadMask (..), MonadThrow, try)
+import Control.Monad.Catch (Exception (fromException), MonadCatch, MonadMask (..), MonadThrow, finally, try)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.IO.Unlift (MonadUnliftIO (..))
 import Control.Monad.Primitive (PrimMonad (..))
@@ -84,6 +85,9 @@ allocate_ mk free = ResM (void (R.allocate_ mk free))
 
 register :: IO () -> ResM ()
 register free = ResM (void (R.register free))
+
+finallyRegister :: ResM a -> IO () -> ResM a
+finallyRegister act free = ResM (finally (unResM act) (unResM (register free)))
 
 scoped :: (STM () -> ResM a) -> ResM a
 scoped f = ResM $ do
