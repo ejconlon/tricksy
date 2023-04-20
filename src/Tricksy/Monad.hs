@@ -89,11 +89,11 @@ register free = ResM (void (R.register free))
 finallyRegister :: ResM a -> IO () -> ResM a
 finallyRegister act free = ResM (finally (unResM act) (unResM (register free)))
 
-scoped :: (STM () -> ResM a) -> ResM a
-scoped f = ResM $ do
-  tidsVar <- asks reThreadIdsVar
+scoped :: (STM () -> ResM a) -> IO a
+scoped f = runResM $ do
+  tidsVar <- ResM (asks reThreadIdsVar)
   let waitThreads = readTVar tidsVar >>= \tids -> unless (Set.null tids) retry
-  liftIO (runResM (f waitThreads))
+  f waitThreads
 
 reraisable :: SomeException -> Bool
 reraisable err =

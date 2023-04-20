@@ -4,10 +4,11 @@ module Tricksy.Ring
   , newRingIO
   , newRing
   , ringWrite
+  , Next (..)
   , Cursor
   , newCursor
   , newCursorIO
-  , cursorAdvance
+  , cursorNext
   )
 where
 
@@ -48,6 +49,9 @@ data Ring a = Ring
   , ringWriteHead :: !(TVar Pos)
   }
 
+data Next a = Next {nextDropped :: !Int, nextValue :: !a}
+  deriving stock (Eq, Ord, Show, Functor, Foldable, Traversable)
+
 data Cursor a = Cursor
   { cursorRing :: !(Ring a)
   , cursorReadHead :: !(TVar Pos)
@@ -79,8 +83,8 @@ newCursorIO r = do
   v <- newTVarIO h
   pure (Cursor r v)
 
-cursorAdvance :: Cursor a -> STM (Int, a)
-cursorAdvance (Cursor r rhVar) = do
+cursorNext :: Cursor a -> STM (Next a)
+cursorNext (Cursor r rhVar) = do
   rh <- readTVar rhVar
   wh <- readTVar (ringWriteHead r)
   if rh == wh
@@ -89,6 +93,6 @@ cursorAdvance (Cursor r rhVar) = do
       Nothing -> retry
       Just rl -> do
         let (dropped, used) = if rh >= rl then (0, rh) else (elemDiff (ringCap r) rl rh, rl)
-            !next = nextPos (ringCap r) used
-        writeTVar rhVar next
-        fmap (dropped,) (readTVar (ringBuf r V.! posIndex used))
+            !pos = nextPos (ringCap r) used
+        writeTVar rhVar pos
+        fmap (Next dropped) (readTVar (ringBuf r V.! posIndex used))

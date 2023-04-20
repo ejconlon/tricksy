@@ -15,44 +15,23 @@ import Data.Sequence qualified as Seq
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..))
 import Tricksy.Cache (CacheHandler, runCache)
-import Tricksy.Control (Control (..), allocateControl, newControl, scopedControl, trackControl)
+import Tricksy.Control (Control (..), Ref, allocateControl, controlDeactivateIO, controlReadActiveIO, guarded, guardedMay, guarded_, mkRef, newControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, finallyRegister, runResM, spawnThread, stopThread)
-import Tricksy.Ring (Ring, cursorAdvance, newCursor, newRingIO)
+import Tricksy.Ring (Next, Ring, cursorNext, newCursor, newRingIO)
 import Tricksy.Rw (Rw (..), chanRw, ringRwIO)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
-
-guarded :: Control -> STM () -> STM Active
-guarded ctl act = do
-  active <- controlReadActive ctl
-  case active of
-    ActiveNo -> pure ActiveNo
-    ActiveYes -> act *> controlReadActive ctl
-
-guarded_ :: Control -> STM () -> STM ()
-guarded_ ctl act = do
-  active <- controlReadActive ctl
-  case active of
-    ActiveNo -> pure ()
-    ActiveYes -> act
-
-guardedIO_ :: Control -> IO () -> IO ()
-guardedIO_ ctl act = do
-  active <- atomically (controlReadActive ctl)
-  case active of
-    ActiveNo -> pure ()
-    ActiveYes -> act
 
 -- | Consumer callback
 type Callback m a = Control -> a -> m ()
 
 guardedCall :: Control -> Callback STM a -> a -> STM Active
-guardedCall ctl cb a = guarded ctl (cb ctl a)
+guardedCall ctl cb a = guarded (controlReadActive ctl) (cb ctl a)
 
 guardedCall_ :: Control -> Callback STM a -> a -> STM ()
-guardedCall_ ctl cb a = guarded_ ctl (cb ctl a)
+guardedCall_ ctl cb a = guarded_ (controlReadActive ctl) (cb ctl a)
 
 atomicCall :: Callback STM a -> Callback IO a
-atomicCall ctl cb a = atomically (ctl cb a)
+atomicCall cb ctl a = atomically (cb ctl a)
 
 -- | Event producer - takes a consumer callback and pushes events through.
 newtype Events a = Events {produceE :: Control -> Callback STM a -> IO ()}
@@ -79,10 +58,7 @@ parallelE es = Events $ \ctl cb -> scopedControl ctl $ do
 andThenE :: Events x -> Events x -> Events x
 andThenE e1 e2 = Events $ \ctl cb -> do
   produceE e1 ctl cb
-  active <- liftIO (atomically (controlReadActive ctl))
-  case active of
-    ActiveNo -> pure ()
-    ActiveYes -> produceE e2 ctl cb
+  guarded_ (controlReadActiveIO ctl) (produceE e2 ctl cb)
 
 sequentialE :: [Events x] -> Events x
 sequentialE es = Events $ \c cb -> do
@@ -108,20 +84,17 @@ spawnChild prodCtl conCtl sourceVar genVar f cb = runResM (go Nothing)
  where
   go mc = do
     mz <- liftIO $ atomically $ do
-      active <- controlReadActive conCtl
-      case active of
-        ActiveNo -> pure Nothing
-        ActiveYes -> do
-          ma <- tryTakeTMVar sourceVar
-          case ma of
-            Nothing -> do
-              parentActive <- controlReadActive prodCtl
-              case parentActive of
-                ActiveNo -> pure Nothing
-                ActiveYes -> retry
-            Just a -> do
-              g <- readTVar genVar
-              pure (Just (a, g))
+      guardedMay (controlReadActive conCtl) $ do
+        ma <- tryTakeTMVar sourceVar
+        case ma of
+          Nothing -> do
+            parentActive <- controlReadActive prodCtl
+            case parentActive of
+              ActiveNo -> pure Nothing
+              ActiveYes -> retry
+          Just a -> do
+            g <- readTVar genVar
+            pure (Just (a, g))
     case mz of
       Nothing -> pure ()
       Just (a, g) -> do
@@ -150,10 +123,10 @@ instance Monad Events where
       void (spawnThread (spawnChild prodCtl conCtl sourceVar genVar f cb))
 
 liftE :: IO a -> Events a
-liftE act = Events (\ctl cb -> liftIO (guardedIO_ ctl (act >>= atomically . guardedCall_ ctl cb)))
+liftE act = Events (\ctl cb -> liftIO (guarded_ (controlReadActiveIO ctl) (act >>= atomically . guardedCall_ ctl cb)))
 
 repeatE :: IO a -> Events a
-repeatE act = Events (\ctl cb -> liftIO (guardedIO_ ctl (go ctl cb)))
+repeatE act = Events (\ctl cb -> liftIO (guarded_ (controlReadActiveIO ctl) (go ctl cb)))
  where
   go ctl cb = do
     a <- act
@@ -327,33 +300,26 @@ explicitHoldB = BehaviorHold
 resB :: ResM (Behavior a) -> Behavior a
 resB = BehaviorRes
 
-newtype CacheRef a = CacheRef
-  { crAction :: STM a
-  }
-
-newtype HoldRef a = HoldRef
-  { hrCurVar :: TVar a
-  }
-
 applyWithB :: (a -> b -> STM c) -> Behavior a -> Events b -> Events c
 applyWithB f b e = Events $ \ctl cb -> do
   scopedControl ctl $ do
     r <- observeB b
-    liftIO (produceE e ctl (\d x -> r >>= flip f x >>= cb d))
+    -- liftIO (produceE e ctl (\d b -> r >>= flip f b >>= cb d))
+    error "TODO"
 
-spawnCacheB :: CacheBehavior a -> ResM (STM a)
-spawnCacheB (CacheBehavior ttl han act) = runCache ttl han act
+spawnCacheB :: CacheBehavior a -> ResM (Ref a)
+spawnCacheB (CacheBehavior ttl han act) = fmap fst (runCache ttl han act)
 
-spawnHoldB :: HoldBehavior a -> ResM (STM a)
+spawnHoldB :: HoldBehavior a -> ResM (Ref a)
 spawnHoldB (HoldBehavior start e) = do
   ctl <- liftIO newControl
   curVar <- liftIO (newTVarIO start)
   finallyRegister
     (void (spawnThread (produceE e ctl (\_ a -> writeTVar curVar a))))
-    (atomically (controlDeactivate ctl))
-  pure (readTVar curVar)
+    (controlDeactivateIO ctl)
+  pure (mkRef (pure (readTVar curVar)))
 
-spawnMergeB :: MergeBehavior a -> ResM (STM a)
+spawnMergeB :: MergeBehavior a -> ResM (Ref a)
 spawnMergeB (MergeBehavior f b1 b2) =
   case b1 of
     BehaviorPure x -> observeB (fmap (f x) b2)
@@ -366,7 +332,7 @@ spawnMergeB (MergeBehavior f b1 b2) =
         r2 <- observeB b2
         pure (liftA2 f r1 r2)
 
-observeB :: Behavior a -> ResM (STM a)
+observeB :: Behavior a -> ResM (Ref a)
 observeB = \case
   BehaviorPure a -> pure (pure a)
   BehaviorCache cb -> spawnCacheB cb
@@ -410,11 +376,11 @@ consumeIO :: Control -> Control -> STM a -> Callback IO a -> IO ()
 consumeIO prodCtl conCtl rd f = go
  where
   go = do
-    ma <- atomically $ do
-      conActive <- controlReadActive conCtl
-      case conActive of
-        ActiveNo -> pure Nothing
-        ActiveYes -> orElse (fmap Just rd) (Nothing <$ controlWait prodCtl)
+    ma <-
+      atomically $
+        guardedMay
+          (controlReadActive conCtl)
+          (orElse (fmap Just rd) (Nothing <$ controlWait prodCtl))
     case ma of
       Nothing -> pure ()
       Just a -> f conCtl a *> go
@@ -440,12 +406,12 @@ rwRunE mkRw f e = do
 -- | Runs the callback on all events in the stream. Uses a ring buffer to
 -- maintain constant space during consumption, so the callback is informed of
 -- number of dropped events.
-ringRunE :: Int -> Callback IO (Int, a) -> Events a -> IO ()
+ringRunE :: Int -> Callback IO (Next a) -> Events a -> IO ()
 ringRunE cap = rwRunE (newRingIO cap >>= ringRwIO)
 
 -- | Creates an event stream from an IO action. Returning 'Nothing' ends the stream.
 repeatMayE :: IO (Maybe a) -> Events a
-repeatMayE f = Events (\ctl cb -> liftIO (guardedIO_ ctl (go ctl cb)))
+repeatMayE f = Events (\ctl cb -> liftIO (guarded_ (controlReadActiveIO ctl) (go ctl cb)))
  where
   go ctl cb = do
     ma <- f
@@ -461,7 +427,7 @@ repeatTxnE :: STM a -> Events a
 repeatTxnE act = Events (\ctl cb -> liftIO (go ctl cb))
  where
   go ctl cb = do
-    active <- atomically (guarded ctl (act >>= cb ctl))
+    active <- atomically (guarded (controlReadActive ctl) (act >>= cb ctl))
     case active of
       ActiveNo -> pure ()
       ActiveYes -> go ctl cb
@@ -477,22 +443,18 @@ lockE lockVar = repeatTxnE (takeTMVar lockVar)
 -- | Events from a ring buffer
 -- The first component of tuple is the number of dropped events between invocations
 -- (always non-negative). If the consumer keeps up with the producer, it will be 0.
-ringE :: Ring a -> Events (Int, a)
+ringE :: Ring a -> Events (Next a)
 ringE ring = Events (\ctl cb -> liftIO (goStart ctl cb))
  where
   goStart ctl cb = do
-    mc <- atomically $ do
-      active <- controlReadActive ctl
-      case active of
-        ActiveNo -> pure Nothing
-        ActiveYes -> do
-          cur <- newCursor ring
-          p <- cursorAdvance cur
-          cb ctl p
-          pure (Just cur)
+    mc <- atomically $ guardedMay (controlReadActive ctl) $ do
+      cur <- newCursor ring
+      p <- cursorNext cur
+      cb ctl p
+      pure (Just cur)
     for_ mc (goRest ctl cb)
   goRest ctl cb cur = do
-    active <- atomically (guarded ctl (cursorAdvance cur >>= cb ctl))
+    active <- atomically (guarded (controlReadActive ctl) (cursorNext cur >>= cb ctl))
     case active of
       ActiveNo -> pure ()
       ActiveYes -> goRest ctl cb cur
@@ -503,7 +465,7 @@ rwBufferE mkRw e = Events (\ctl cb -> internalRwRunE mkRw ctl (atomicCall cb) e)
 
 -- | Buffers the events stream using a ring buffer with the given capacity.
 -- Dropped event counts are added to the stream.
-ringBufferE :: Int -> Events a -> Events (Int, a)
+ringBufferE :: Int -> Events a -> Events (Next a)
 ringBufferE cap = rwBufferE (newRingIO cap >>= ringRwIO)
 
 -- | Reads to EOF
