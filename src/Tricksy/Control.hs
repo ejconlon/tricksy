@@ -13,7 +13,7 @@ import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (finally)
 import Control.Monad.IO.Class (liftIO)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, newActiveVarIO, readActiveVar, waitActiveVar)
-import Tricksy.Monad (ResM, allocate, scoped)
+import Tricksy.Monad (ResM, allocate, runResM, scoped)
 
 data Control = Control
   { controlReadActive :: !(STM Active)
@@ -27,18 +27,18 @@ activeVarControl v = Control (readActiveVar v) (deactivateVar v) (waitActiveVar 
 allocateActiveVar :: ResM ActiveVar
 allocateActiveVar = allocate newActiveVarIO (atomically . deactivateVar)
 
-newControl :: ResM Control
-newControl = liftIO (fmap activeVarControl newActiveVarIO)
+newControl :: IO Control
+newControl = fmap activeVarControl newActiveVarIO
 
 allocateControl :: ResM Control
 allocateControl = fmap activeVarControl allocateActiveVar
 
-scopedControl :: Control -> ResM () -> ResM ()
+scopedControl :: Control -> ResM () -> IO ()
 scopedControl ctl act = do
   active <- liftIO (atomically (controlReadActive ctl))
   case active of
     ActiveNo -> pure ()
-    ActiveYes -> scoped $ \waitThreads ->
+    ActiveYes -> runResM $ scoped $ \waitThreads ->
       act *> liftIO (atomically (orElse (controlWait ctl) waitThreads))
 
 -- | Deactivate the control when the action has finished

@@ -40,7 +40,7 @@ cacheThread = undefined
 
 runCache :: TimeDelta -> CacheHandler z a -> IO z -> ResM (STM a)
 runCache ttl han act = do
-  ctl <- newControl
+  ctl <- liftIO newControl
   ce <- liftIO (CacheEnv ctl ttl han act <$> newEmptyTMVarIO)
   finallyRegister
     (void (spawnThread (cacheThread ce)))

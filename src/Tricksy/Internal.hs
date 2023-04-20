@@ -55,7 +55,7 @@ atomicCall :: Callback STM a -> Callback IO a
 atomicCall ctl cb a = atomically (ctl cb a)
 
 -- | Event producer - takes a consumer callback and pushes events through.
-newtype Events a = Events {produceE :: Control -> Callback STM a -> ResM ()}
+newtype Events a = Events {produceE :: Control -> Callback STM a -> IO ()}
 
 instance Functor Events where
   fmap f e = Events (\ctl cb -> produceE e ctl (\d a -> cb d (f a)))
@@ -69,12 +69,12 @@ emptyE = Events (\_ _ -> pure ())
 
 interleaveE :: Events x -> Events x -> Events x
 interleaveE el er = Events $ \ctl cb -> scopedControl ctl $ do
-  void (spawnThread (runResM (produceE el ctl cb)))
-  void (spawnThread (runResM (produceE er ctl cb)))
+  void (spawnThread (produceE el ctl cb))
+  void (spawnThread (produceE er ctl cb))
 
 parallelE :: Foldable f => f (Events x) -> Events x
 parallelE es = Events $ \ctl cb -> scopedControl ctl $ do
-  for_ es (\e -> spawnThread (runResM (produceE e ctl cb)))
+  for_ es (\e -> spawnThread (produceE e ctl cb))
 
 andThenE :: Events x -> Events x -> Events x
 andThenE e1 e2 = Events $ \ctl cb -> do
@@ -127,7 +127,7 @@ spawnChild prodCtl conCtl sourceVar genVar f cb = runResM (go Nothing)
       Just (a, g) -> do
         let e' = f a
             ctl' = genControl conCtl genVar g
-        newCid <- spawnThread (runResM (produceE e' ctl' cb))
+        newCid <- spawnThread (produceE e' ctl' cb)
         case mc of
           Just oldCid -> liftIO (stopThread oldCid)
           Nothing -> pure ()
@@ -135,7 +135,7 @@ spawnChild prodCtl conCtl sourceVar genVar f cb = runResM (go Nothing)
 
 parentProduce :: Control -> Control -> TMVar a -> TVar Int -> Events a -> IO ()
 parentProduce prodCtl conCtl sourceVar genVar ea =
-  trackControl prodCtl $ runResM $ produceE ea conCtl $ \_ a -> do
+  trackControl prodCtl $ produceE ea conCtl $ \_ a -> do
     putTMVar sourceVar a
     modifyTVar' genVar succ
 
@@ -339,17 +339,17 @@ applyWithB :: (a -> b -> STM c) -> Behavior a -> Events b -> Events c
 applyWithB f b e = Events $ \ctl cb -> do
   scopedControl ctl $ do
     r <- observeB b
-    produceE e ctl (\d x -> r >>= flip f x >>= cb d)
+    liftIO (produceE e ctl (\d x -> r >>= flip f x >>= cb d))
 
 spawnCacheB :: CacheBehavior a -> ResM (STM a)
 spawnCacheB (CacheBehavior ttl han act) = runCache ttl han act
 
 spawnHoldB :: HoldBehavior a -> ResM (STM a)
 spawnHoldB (HoldBehavior start e) = do
-  ctl <- newControl
+  ctl <- liftIO newControl
   curVar <- liftIO (newTVarIO start)
   finallyRegister
-    (void (spawnThread (runResM (produceE e ctl (\_ a -> writeTVar curVar a)))))
+    (void (spawnThread (produceE e ctl (\_ a -> writeTVar curVar a))))
     (atomically (controlDeactivate ctl))
   pure (readTVar curVar)
 
@@ -419,28 +419,28 @@ consumeIO prodCtl conCtl rd f = go
       Nothing -> pure ()
       Just a -> f conCtl a *> go
 
-internalRwRunE :: IO (Rw a b) -> Control -> Callback IO b -> Events a -> ResM ()
+internalRwRunE :: IO (Rw a b) -> Control -> Callback IO b -> Events a -> IO ()
 internalRwRunE mkRw conCtl f e =
   scopedControl conCtl $ do
     rw <- liftIO mkRw
     prodCtl <- allocateControl
     let sourceCb = const (rwWrite rw)
         sinkFn = rwRead rw
-    void (spawnThread (trackControl prodCtl (runResM (produceE e conCtl sourceCb))))
+    void (spawnThread (trackControl prodCtl (produceE e conCtl sourceCb)))
     void (spawnThread (consumeIO prodCtl conCtl sinkFn f))
 
 -- | Runs the callback on all events in the stream. Takes a function to
 -- create a buffer strategy, so you can choose how you want the producer and
 -- consumer to interact.
-rwRunE :: IO (Rw a b) -> Callback IO b -> Events a -> ResM ()
+rwRunE :: IO (Rw a b) -> Callback IO b -> Events a -> IO ()
 rwRunE mkRw f e = do
-  conCtl <- allocateControl
+  conCtl <- newControl
   internalRwRunE mkRw conCtl f e
 
 -- | Runs the callback on all events in the stream. Uses a ring buffer to
 -- maintain constant space during consumption, so the callback is informed of
 -- number of dropped events.
-ringRunE :: Int -> Callback IO (Int, a) -> Events a -> ResM ()
+ringRunE :: Int -> Callback IO (Int, a) -> Events a -> IO ()
 ringRunE cap = rwRunE (newRingIO cap >>= ringRwIO)
 
 -- | Creates an event stream from an IO action. Returning 'Nothing' ends the stream.
@@ -515,6 +515,6 @@ stmMapE f e = Events (\ctl cb -> produceE e ctl (\ctl' a -> f a >>= cb ctl'))
 
 -- | Prints events with timestamps
 debugPrintE :: Show a => Events a -> IO ()
-debugPrintE e = runResM $ flip (rwRunE (fmap chanRw newTChanIO)) e $ \_ a -> do
+debugPrintE e = flip (rwRunE (fmap chanRw newTChanIO)) e $ \_ a -> do
   m <- currentMonoTime
   print (m, a)
