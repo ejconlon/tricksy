@@ -510,6 +510,9 @@ ringBufferE cap = rwBufferE (newRingIO cap >>= ringRwIO)
 stdinE :: Events String
 stdinE = repeatMayE (catchJust (\e -> if isEOFError e then Just () else Nothing) (fmap Just getLine) (const (pure Nothing)))
 
+stmMapE :: (a -> STM b) -> Events a -> Events b
+stmMapE f e = Events (\ctl cb -> produceE e ctl (\ctl' a -> f a >>= cb ctl'))
+
 -- | Prints events with timestamps
 debugPrintE :: Show a => Events a -> IO ()
 debugPrintE e = runResM $ flip (rwRunE (fmap chanRw newTChanIO)) e $ \_ a -> do
