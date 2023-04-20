@@ -4,7 +4,7 @@ import Control.Applicative (liftA2)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, orElse, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
-import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
+import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (catchJust)
 import Control.Monad (ap, void, when)
 import Control.Monad.IO.Class (liftIO)
@@ -14,8 +14,9 @@ import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
 import System.IO.Error (isEOFError)
 import Tricksy.Active (Active (..))
+import Tricksy.Barrier (newBarrier, trackBarrier)
 import Tricksy.Cache (CacheHandler, runCache)
-import Tricksy.Control (Control (..), Ref, allocateControl, controlDeactivateIO, controlReadActiveIO, guarded, guardedMay, guarded_, mkRef, newControl, scopedControl, trackControl)
+import Tricksy.Control (Control (..), allocateControl, controlDeactivateIO, controlReadActiveIO, guarded, guardedMay, guarded_, newControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, finallyRegister, runResM, spawnThread, stopThread)
 import Tricksy.Ring (Next, Ring, cursorNext, newCursor, newRingIO)
 import Tricksy.Rw (Rw (..), chanRw, ringRwIO)
@@ -60,11 +61,13 @@ andThenE e1 e2 = Events $ \ctl cb -> do
   produceE e1 ctl cb
   guarded_ (controlReadActiveIO ctl) (produceE e2 ctl cb)
 
-sequentialE :: [Events x] -> Events x
-sequentialE es = Events $ \c cb -> do
-  case es of
-    [] -> pure ()
-    z : zs -> produceE (z `andThenE` sequentialE zs) c cb
+seriesE :: Foldable f => f (Events x) -> Events x
+seriesE = go . toList
+ where
+  go es = Events $ \c cb -> do
+    case es of
+      [] -> pure ()
+      z : zs -> produceE (z `andThenE` go zs) c cb
 
 genControl :: Control -> TVar Int -> Int -> Control
 genControl ctl genVar myGen = ctl {controlReadActive = rd, controlWait = wt}
@@ -158,6 +161,28 @@ fixE :: Int -> (STM (Seq a) -> Events a) -> Events a
 fixE cap f = Events $ \ctl cb -> do
   aVar <- liftIO (newTVarIO Seq.empty)
   produceE (f (readTVar aVar)) ctl (\d a -> capSnoc cap aVar a *> cb d a)
+
+callZipWith :: (a -> b -> c) -> TVar (Maybe a) -> TVar (Maybe b) -> Callback STM c -> Callback STM a
+callZipWith f aVar bVar cb ctl = guardedCall_ ctl $ \ctl' a -> do
+  void (writeTVar aVar (Just a))
+  mb <- readTVar bVar
+  case mb of
+    Nothing -> pure ()
+    Just b -> cb ctl' (f a b)
+
+zipWithE :: (a -> b -> c) -> Events a -> Events b -> Events c
+zipWithE f ea eb = Events $ \ctl cb -> do
+  aVar <- liftIO (newTVarIO Nothing)
+  bVar <- liftIO (newTVarIO Nothing)
+  let cba = callZipWith f aVar bVar cb
+      cbb = callZipWith (flip f) bVar aVar cb
+  scopedControl ctl $ do
+    barrier <- liftIO (atomically (newBarrier 1 (controlDeactivate ctl)))
+    void (spawnThread (trackBarrier barrier (produceE ea ctl cba)))
+    void (spawnThread (trackBarrier barrier (produceE eb ctl cbb)))
+
+zipE :: Events a -> Events b -> Events (a, b)
+zipE = zipWithE (,)
 
 unfoldE :: (s -> Maybe (a, s)) -> s -> Events a
 unfoldE f s0 = Events (\ctl cb -> liftIO (newTVarIO s0 >>= go ctl cb))
@@ -300,26 +325,35 @@ explicitHoldB = BehaviorHold
 resB :: ResM (Behavior a) -> Behavior a
 resB = BehaviorRes
 
-applyWithB :: (a -> b -> STM c) -> Behavior a -> Events b -> Events c
-applyWithB f b e = Events $ \ctl cb -> do
+rawApplyWithB :: IO (Rw b x) -> (a -> x -> IO c) -> Behavior a -> Events b -> Events c
+rawApplyWithB mkRw f b e = Events $ \ctl cb -> do
   scopedControl ctl $ do
+    rw <- liftIO mkRw
     r <- observeB b
+
     -- liftIO (produceE e ctl (\d b -> r >>= flip f b >>= cb d))
     error "TODO"
 
-spawnCacheB :: CacheBehavior a -> ResM (Ref a)
+-- applyWithB :: Int -> (a -> Next b -> IO c) -> Behavior a -> Events b -> Events c
+-- applyWithB cap f b e = Events $ \ctl cb -> do
+--   scopedControl ctl $ do
+--     r <- observeB b
+--     -- liftIO (produceE e ctl (\d b -> r >>= flip f b >>= cb d))
+--     error "TODO"
+
+spawnCacheB :: CacheBehavior a -> ResM (IO a)
 spawnCacheB (CacheBehavior ttl han act) = fmap fst (runCache ttl han act)
 
-spawnHoldB :: HoldBehavior a -> ResM (Ref a)
+spawnHoldB :: HoldBehavior a -> ResM (IO a)
 spawnHoldB (HoldBehavior start e) = do
   ctl <- liftIO newControl
   curVar <- liftIO (newTVarIO start)
   finallyRegister
     (void (spawnThread (produceE e ctl (\_ a -> writeTVar curVar a))))
     (controlDeactivateIO ctl)
-  pure (mkRef (pure (readTVar curVar)))
+  pure (readTVarIO curVar)
 
-spawnMergeB :: MergeBehavior a -> ResM (Ref a)
+spawnMergeB :: MergeBehavior a -> ResM (IO a)
 spawnMergeB (MergeBehavior f b1 b2) =
   case b1 of
     BehaviorPure x -> observeB (fmap (f x) b2)
@@ -332,7 +366,7 @@ spawnMergeB (MergeBehavior f b1 b2) =
         r2 <- observeB b2
         pure (liftA2 f r1 r2)
 
-observeB :: Behavior a -> ResM (Ref a)
+observeB :: Behavior a -> ResM (IO a)
 observeB = \case
   BehaviorPure a -> pure (pure a)
   BehaviorCache cb -> spawnCacheB cb
@@ -474,6 +508,9 @@ stdinE = repeatMayE (catchJust (\e -> if isEOFError e then Just () else Nothing)
 
 stmMapE :: (a -> STM b) -> Events a -> Events b
 stmMapE f e = Events (\ctl cb -> produceE e ctl (\ctl' a -> f a >>= cb ctl'))
+
+ioMapE :: IO (Rw a b) -> (b -> IO c) -> Events a -> Events c
+ioMapE mkRw f e = error "TODO"
 
 -- | Prints events with timestamps
 debugPrintE :: Show a => Events a -> IO ()

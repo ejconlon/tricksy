@@ -9,17 +9,11 @@ module Tricksy.Control
   , guarded
   , guarded_
   , guardedMay
-  , Ref (..)
-  , mkRef
-  , peelRef
-  , viewRef
   )
 where
 
-import Control.Applicative (Applicative (..))
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (finally)
-import Control.Monad ((>=>))
 import Control.Monad.IO.Class (liftIO)
 import Tricksy.Active (Active (..), ActiveVar, deactivateVar, newActiveVarIO, readActiveVar, waitActiveVar)
 import Tricksy.Monad (ResM, allocate, scoped)
@@ -79,24 +73,3 @@ guarded_ = guardedDefault ()
 
 guardedMay :: Monad m => m Active -> m (Maybe a) -> m (Maybe a)
 guardedMay = guardedDefault Nothing
-
-newtype Ref a = Ref {unRef :: STM (STM a)}
-
-instance Functor Ref where
-  fmap f (Ref x) = Ref (fmap (fmap f) x)
-
-instance Applicative Ref where
-  pure = Ref . pure . pure
-  Ref x <*> Ref y = Ref (liftA2 (<*>) x y)
-  liftA2 f (Ref x) (Ref y) = Ref (liftA2 (liftA2 f) x y)
-  Ref x *> Ref y = Ref (liftA2 (*>) x y)
-  Ref x <* Ref y = Ref (liftA2 (<*) x y)
-
-mkRef :: STM (STM a) -> Ref a
-mkRef = Ref
-
-peelRef :: Ref a -> IO (STM a)
-peelRef = atomically . unRef
-
-viewRef :: Ref a -> IO a
-viewRef = peelRef >=> atomically

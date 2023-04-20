@@ -11,10 +11,9 @@ import Control.Exception (SomeException, try)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import GHC.Conc (unsafeIOToSTM)
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import Tricksy.Active (Active (..))
-import Tricksy.Control (Control (..), Ref, guardedMay, guarded_, mkRef, newControl, viewRef)
+import Tricksy.Control (Control (..), guardedMay, guarded_, newControl)
 import Tricksy.Monad (ResM, finallyRegister, runResM, scoped, spawnThread)
 import Tricksy.Time (MonoTime, TimeDelta, currentMonoTime, diffMonoTime, threadDelayDelta, timeDeltaFromFracSecs)
 
@@ -39,10 +38,6 @@ data CacheEnv z a = CacheEnv
   , ceReqVar :: !(TVar (Maybe (Request a)))
   , ceFinalVar :: !(TVar (Maybe a))
   }
-
--- Dangerous?
-monoTimeSTM :: STM MonoTime
-monoTimeSTM = unsafeIOToSTM currentMonoTime
 
 -- Read the last known value
 lastVal :: CacheEnv z a -> STM (Maybe a)
@@ -90,22 +85,24 @@ mkNewReq ce now = do
   writeTVar (ceReqVar ce) (Just newReq)
   pure (reqStateVar newReq)
 
-cacheRequest :: CacheEnv z a -> Ref a
-cacheRequest ce = mkRef $ do
-  active <- controlReadActive (ceControl ce)
-  case active of
-    ActiveNo -> pure (ensureFinalVar ce)
-    ActiveYes -> do
-      mayOldReq <- readTVar (ceReqVar ce)
-      now <- monoTimeSTM
-      resVar <- case mayOldReq of
-        Nothing -> mkNewReq ce now
-        Just oldReq -> do
-          let withinTtl = maybe False (< ceTtl ce) (diffMonoTime now (reqTime oldReq))
-          if withinTtl
-            then pure (reqStateVar oldReq)
-            else mkNewReq ce now
-      pure (cacheRead ce resVar)
+cacheRequest :: CacheEnv z a -> IO a
+cacheRequest ce = do
+  now <- currentMonoTime
+  rd <- atomically $ do
+    active <- controlReadActive (ceControl ce)
+    case active of
+      ActiveNo -> pure (ensureFinalVar ce)
+      ActiveYes -> do
+        mayOldReq <- readTVar (ceReqVar ce)
+        resVar <- case mayOldReq of
+          Nothing -> mkNewReq ce now
+          Just oldReq -> do
+            let withinTtl = maybe False (< ceTtl ce) (diffMonoTime now (reqTime oldReq))
+            if withinTtl
+              then pure (reqStateVar oldReq)
+              else mkNewReq ce now
+        pure (cacheRead ce resVar)
+  atomically rd
 
 cacheFork :: CacheEnv z a -> IO ()
 cacheFork ce = runResM go
@@ -142,13 +139,13 @@ cacheFetch ctl han act req = guarded_ (atomically (controlReadActive ctl)) $ do
 cacheDispose :: CacheEnv z a -> STM ()
 cacheDispose ce = controlDeactivate (ceControl ce)
 
-runCache :: TimeDelta -> CacheHandler z a -> IO z -> ResM (Ref a, STM ())
+runCache :: TimeDelta -> CacheHandler z a -> IO z -> ResM (IO a, IO ())
 runCache ttl han act = do
   ctl <- liftIO newControl
   ce <- liftIO (CacheEnv ctl ttl han act <$> newTVarIO Nothing <*> newTVarIO Nothing)
   let dispose = cacheDispose ce
   finallyRegister (void (spawnThread (cacheFork ce))) (atomically dispose)
-  pure (cacheRequest ce, dispose)
+  pure (cacheRequest ce, atomically dispose)
 
 testCache :: IO ()
 testCache = do
@@ -163,26 +160,26 @@ testCache = do
   scoped $ \_ -> do
     (readCache, dispose) <- runCache ttl han act
     liftIO $ do
-      v1 <- viewRef readCache
+      v1 <- readCache
       assertEq "v1" v1 1
       writeIORef ref 2
-      v2 <- viewRef readCache
+      v2 <- readCache
       assertEq "v2" v2 1
       threadDelayDelta ttl
       threadDelayDelta ttl
-      v3 <- viewRef readCache
+      v3 <- readCache
       assertEq "v3" v3 2
       writeIORef ref 3
-      atomically dispose
+      dispose
       threadDelayDelta ttl
       threadDelayDelta ttl
-      v4 <- viewRef readCache
+      v4 <- readCache
       assertEq "v4" v4 2
   -- Test without requests
   scoped $ \_ -> do
     (readCache, dispose) <- runCache ttl han act
     liftIO $ do
-      atomically dispose
-      v1 <- viewRef readCache
+      dispose
+      v1 <- readCache
       assertEq "v1" v1 0
   putStrLn "done"
