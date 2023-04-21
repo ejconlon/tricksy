@@ -19,7 +19,7 @@ import Tricksy.Cache (CacheHandler, runCache)
 import Tricksy.Control (Control (..), allocateControl, controlDeactivateIO, controlReadActiveIO, guarded, guardedMay, guarded_, newControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, finallyRegister, runResM, spawnThread, stopThread)
 import Tricksy.Ring (Next, Ring, cursorNext, newCursor, newRingIO)
-import Tricksy.Rw (Rw (..), chanRw, ringRwIO)
+import Tricksy.Rw (Rw (..), chanRw, newRingRw, ringRwIO)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
 
 -- | Consumer callback
@@ -326,20 +326,14 @@ resB :: ResM (Behavior a) -> Behavior a
 resB = BehaviorRes
 
 rawApplyWithB :: IO (Rw b x) -> (a -> x -> IO c) -> Behavior a -> Events b -> Events c
-rawApplyWithB mkRw f b e = Events $ \ctl cb -> do
+rawApplyWithB mkRw f b e = Events $ \ctl cb ->
   scopedControl ctl $ do
-    rw <- liftIO mkRw
     r <- observeB b
+    let newCb d x = r >>= \a -> f a x >>= atomically . cb d
+    liftIO (internalRwRunE mkRw ctl newCb e)
 
-    -- liftIO (produceE e ctl (\d b -> r >>= flip f b >>= cb d))
-    error "TODO"
-
--- applyWithB :: Int -> (a -> Next b -> IO c) -> Behavior a -> Events b -> Events c
--- applyWithB cap f b e = Events $ \ctl cb -> do
---   scopedControl ctl $ do
---     r <- observeB b
---     -- liftIO (produceE e ctl (\d b -> r >>= flip f b >>= cb d))
---     error "TODO"
+applyWithB :: Int -> (a -> Next b -> IO c) -> Behavior a -> Events b -> Events c
+applyWithB = rawApplyWithB . newRingRw
 
 spawnCacheB :: CacheBehavior a -> ResM (IO a)
 spawnCacheB (CacheBehavior ttl han act) = fmap fst (runCache ttl han act)
@@ -509,8 +503,13 @@ stdinE = repeatMayE (catchJust (\e -> if isEOFError e then Just () else Nothing)
 stmMapE :: (a -> STM b) -> Events a -> Events b
 stmMapE f e = Events (\ctl cb -> produceE e ctl (\ctl' a -> f a >>= cb ctl'))
 
-ioMapE :: IO (Rw a b) -> (b -> IO c) -> Events a -> Events c
-ioMapE mkRw f e = error "TODO"
+rawIoMapE :: IO (Rw a b) -> (b -> IO c) -> Events a -> Events c
+rawIoMapE mkRw f e = Events $ \ctl cb ->
+  let newCb d b = f b >>= atomically . cb d
+  in  internalRwRunE mkRw ctl newCb e
+
+ioMapE :: Int -> (Next a -> IO c) -> Events a -> Events c
+ioMapE = rawIoMapE . newRingRw
 
 -- | Prints events with timestamps
 debugPrintE :: Show a => Events a -> IO ()
