@@ -1,4 +1,22 @@
-module Tricksy.Vty where
+module Tricksy.Vty
+  ( Size (..)
+  , Rect (..)
+  , Layout (..)
+  , Frame
+  , frameRect
+  , framePart
+  , frameMap
+  , frameBind
+  , Pointed (..)
+  , HasSize (..)
+  , Positioned (..)
+  , Widenable (..)
+  , Stackable (..)
+  , Horizontally (..)
+  , Vertically (..)
+  , build
+  , buildM
+  ) where
 
 import Control.Monad ((<=<))
 import Data.Bifoldable (Bifoldable (..))
@@ -69,6 +87,14 @@ framePart z = Frame (FrameF (Rect point (getSize z)) (ElemPart z))
 frameMap :: (Pointed w, HasSize w) => (z -> w) -> Frame z -> Frame w
 frameMap f = frameCata (frame . fmap f . frameContentF)
 
+frameBind :: (Pointed w, HasSize w) => (z -> Frame w) -> Frame z -> Frame w
+frameBind f = frameCata (elemBind f . frameContentF)
+
+elemBind :: (Pointed w, HasSize w) => (z -> Frame w) -> Elem (Frame w) z -> Frame w
+elemBind f = \case
+  ElemPart z -> f z
+  ElemLayout l fs -> cat l fs
+
 class Pointed a where
   point :: a
 
@@ -92,6 +118,12 @@ instance Pointed a => Pointed (FrameF a) where
 
 instance Pointed (Maybe a) where
   point = Nothing
+
+instance Pointed a => Pointed (Either b a) where
+  point = Right point
+
+instance Pointed () where
+  point = ()
 
 class HasSize a where
   getWidth :: a -> Int
@@ -126,6 +158,16 @@ instance HasSize a => HasSize (Maybe a) where
   getWidth = maybe 0 getWidth
   getHeight = maybe 0 getHeight
   getSize = maybe point getSize
+
+instance (HasSize a, HasSize b) => HasSize (Either b a) where
+  getWidth = either getWidth getWidth
+  getHeight = either getHeight getHeight
+  getSize = either getSize getSize
+
+instance HasSize () where
+  getWidth = const 0
+  getHeight = const 0
+  getSize = const point
 
 class Positioned a where
   position :: a -> Pos
@@ -224,13 +266,14 @@ instance Stackable a => Monoid (Vertically a) where
   mappend = (<>)
   mconcat = Vertically . vcat . fmap unVertically
 
+build :: Stackable w => (z -> w) -> Frame z -> w
+build f = frameCata $ \(FrameF _ e) ->
+  case e of
+    ElemPart z -> f z
+    ElemLayout l ws -> cat l ws
+
 buildM :: (Monad m, Stackable w) => (z -> m w) -> Frame z -> m w
 buildM f = frameCataM $ \(FrameF _ e) ->
   case e of
     ElemPart z -> f z
     ElemLayout l ws -> pure (cat l ws)
-
--- data Widget e = Widget
---   { widgetCallback :: !(e -> IO ())
---   , widgetView :: !(IO Frame)
---   }
