@@ -31,12 +31,15 @@ library
       Tricksy.Barrier
       Tricksy.Cache
       Tricksy.Control
+      Tricksy.Graph
       Tricksy.Internal
       Tricksy.Monad
+      Tricksy.Ref
       Tricksy.Ring
       Tricksy.Rw
       Tricksy.Termbox
       Tricksy.Time
+      Tricksy.Vty
   other-modules:
       Paths_tricksy
   hs-source-dirs:
@@ -80,6 +83,7 @@ library
     , termbox
     , unliftio-core
     , vector
+    , vty
   default-language: GHC2021
 
 test-suite tricksy-test
@@ -131,4 +135,5 @@ test-suite tricksy-test
     , tricksy
     , unliftio-core
     , vector
+    , vty
   default-language: GHC2021

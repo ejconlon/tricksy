@@ -4,7 +4,7 @@ import Control.Applicative (liftA2)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newEmptyTMVarIO, orElse, retry)
 import Control.Concurrent.STM.TChan (TChan, newTChanIO, readTChan)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, takeTMVar, tryTakeTMVar)
-import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, stateTVar, writeTVar)
 import Control.Exception (catchJust)
 import Control.Monad (ap, void, when)
 import Control.Monad.IO.Class (liftIO)
@@ -18,6 +18,7 @@ import Tricksy.Barrier (newBarrier, trackBarrier)
 import Tricksy.Cache (CacheHandler, runCache)
 import Tricksy.Control (Control (..), allocateControl, controlDeactivateIO, controlReadActiveIO, guarded, guardedMay, guarded_, newControl, scopedControl, trackControl)
 import Tricksy.Monad (ResM, finallyRegister, runResM, spawnThread, stopThread)
+import Tricksy.Ref (Ref (..), viewRef)
 import Tricksy.Ring (Next, Ring, cursorNext, newCursor, newRingIO)
 import Tricksy.Rw (Rw (..), chanRw, newRingRw, ringRwIO)
 import Tricksy.Time (MonoTime (..), TimeDelta (..), addMonoTime, currentMonoTime, threadDelayDelta)
@@ -329,25 +330,25 @@ rawApplyWithB :: IO (Rw b x) -> (a -> x -> IO c) -> Behavior a -> Events b -> Ev
 rawApplyWithB mkRw f b e = Events $ \ctl cb ->
   scopedControl ctl $ do
     r <- observeB b
-    let newCb d x = r >>= \a -> f a x >>= atomically . cb d
+    let newCb d x = viewRef r >>= \a -> f a x >>= atomically . cb d
     liftIO (internalRwRunE mkRw ctl newCb e)
 
 applyWithB :: Int -> (a -> Next b -> IO c) -> Behavior a -> Events b -> Events c
 applyWithB = rawApplyWithB . newRingRw
 
-spawnCacheB :: CacheBehavior a -> ResM (IO a)
+spawnCacheB :: CacheBehavior a -> ResM (Ref a)
 spawnCacheB (CacheBehavior ttl han act) = fmap fst (runCache ttl han act)
 
-spawnHoldB :: HoldBehavior a -> ResM (IO a)
+spawnHoldB :: HoldBehavior a -> ResM (Ref a)
 spawnHoldB (HoldBehavior start e) = do
   ctl <- liftIO newControl
   curVar <- liftIO (newTVarIO start)
   finallyRegister
     (void (spawnThread (produceE e ctl (\_ a -> writeTVar curVar a))))
     (controlDeactivateIO ctl)
-  pure (readTVarIO curVar)
+  pure (Ref (pure (readTVar curVar)))
 
-spawnMergeB :: MergeBehavior a -> ResM (IO a)
+spawnMergeB :: MergeBehavior a -> ResM (Ref a)
 spawnMergeB (MergeBehavior f b1 b2) =
   case b1 of
     BehaviorPure x -> observeB (fmap (f x) b2)
@@ -360,7 +361,7 @@ spawnMergeB (MergeBehavior f b1 b2) =
         r2 <- observeB b2
         pure (liftA2 f r1 r2)
 
-observeB :: Behavior a -> ResM (IO a)
+observeB :: Behavior a -> ResM (Ref a)
 observeB = \case
   BehaviorPure a -> pure (pure a)
   BehaviorCache cb -> spawnCacheB cb

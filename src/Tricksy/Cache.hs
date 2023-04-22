@@ -10,12 +10,11 @@ import Control.Concurrent.STM.TVar (TVar, newTVar, newTVarIO, readTVar, writeTVa
 import Control.Exception (SomeException, try)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (newIORef, readIORef, writeIORef)
-import System.IO (BufferMode (..), hSetBuffering, stdout)
 import Tricksy.Active (Active (..))
 import Tricksy.Control (Control (..), guardedMay, guarded_, newControl)
-import Tricksy.Monad (ResM, finallyRegister, runResM, scoped, spawnThread)
-import Tricksy.Time (MonoTime, TimeDelta, currentMonoTime, diffMonoTime, threadDelayDelta, timeDeltaFromFracSecs)
+import Tricksy.Monad (ResM, finallyRegister, runResM, spawnThread)
+import Tricksy.Ref (Ref (..))
+import Tricksy.Time (MonoTime, TimeDelta, currentMonoTime, diffMonoTime)
 
 type CacheHandler z a = Maybe (Either SomeException z) -> STM a
 
@@ -85,10 +84,10 @@ mkNewReq ce now = do
   writeTVar (ceReqVar ce) (Just newReq)
   pure (reqStateVar newReq)
 
-cacheRequest :: CacheEnv z a -> IO a
-cacheRequest ce = do
+cacheRequest :: CacheEnv z a -> Ref a
+cacheRequest ce = Ref $ do
   now <- currentMonoTime
-  rd <- atomically $ do
+  atomically $ do
     active <- controlReadActive (ceControl ce)
     case active of
       ActiveNo -> pure (ensureFinalVar ce)
@@ -102,7 +101,6 @@ cacheRequest ce = do
               then pure (reqStateVar oldReq)
               else mkNewReq ce now
         pure (cacheRead ce resVar)
-  atomically rd
 
 cacheFork :: CacheEnv z a -> IO ()
 cacheFork ce = runResM go
@@ -139,47 +137,10 @@ cacheFetch ctl han act req = guarded_ (atomically (controlReadActive ctl)) $ do
 cacheDispose :: CacheEnv z a -> STM ()
 cacheDispose ce = controlDeactivate (ceControl ce)
 
-runCache :: TimeDelta -> CacheHandler z a -> IO z -> ResM (IO a, IO ())
+runCache :: TimeDelta -> CacheHandler z a -> IO z -> ResM (Ref a, IO ())
 runCache ttl han act = do
   ctl <- liftIO newControl
   ce <- liftIO (CacheEnv ctl ttl han act <$> newTVarIO Nothing <*> newTVarIO Nothing)
   let dispose = cacheDispose ce
   finallyRegister (void (spawnThread (cacheFork ce))) (atomically dispose)
   pure (cacheRequest ce, atomically dispose)
-
-testCache :: IO ()
-testCache = do
-  hSetBuffering stdout LineBuffering
-  putStrLn "starting"
-  let han = defaultCacheHandler 0
-  ref <- newIORef (1 :: Int)
-  let act = putStrLn "fetching" *> readIORef ref
-      ttl = timeDeltaFromFracSecs (0.5 :: Double)
-      assertEq v a b = if a == b then pure () else fail ("Mismatch on " ++ v ++ ": actual " ++ show a ++ " vs expected " ++ show b)
-  -- Test with requests
-  scoped $ \_ -> do
-    (readCache, dispose) <- runCache ttl han act
-    liftIO $ do
-      v1 <- readCache
-      assertEq "v1" v1 1
-      writeIORef ref 2
-      v2 <- readCache
-      assertEq "v2" v2 1
-      threadDelayDelta ttl
-      threadDelayDelta ttl
-      v3 <- readCache
-      assertEq "v3" v3 2
-      writeIORef ref 3
-      dispose
-      threadDelayDelta ttl
-      threadDelayDelta ttl
-      v4 <- readCache
-      assertEq "v4" v4 2
-  -- Test without requests
-  scoped $ \_ -> do
-    (readCache, dispose) <- runCache ttl han act
-    liftIO $ do
-      dispose
-      v1 <- readCache
-      assertEq "v1" v1 0
-  putStrLn "done"
