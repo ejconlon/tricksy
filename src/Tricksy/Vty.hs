@@ -1,38 +1,43 @@
-module Tricksy.Vty
-  ( Layout (..)
-  , V2 (..)
-  , Align (..)
-  , BoxAlign
-  , Box (..)
-  , Frame
-  , frameBox
-  , framePart
-  , frameMap
-  , frameBind
-  , Pointed (..)
-  , HasSize (..)
-  , Widenable (..)
-  , Stackable (..)
-  , Horizontally (..)
-  , Vertically (..)
-  , build
-  , buildM
-  , hitFrame
-  , Widget (..)
-  , widgetConst
-  -- , buildW
-  ) where
+module Tricksy.Vty where
 
-import Control.Monad ((<=<))
+-- ( Layout (..)
+-- , V2 (..)
+-- , Align (..)
+-- , BoxAlign
+-- , Box (..)
+-- , Frame
+-- , frameBox
+-- , framePart
+-- , frameMap
+-- , frameBind
+-- , Pointed (..)
+-- , HasSize (..)
+-- , Widenable (..)
+-- , Stackable (..)
+-- , Horizontally (..)
+-- , Vertically (..)
+-- , build
+-- , buildM
+-- , hitFrame
+-- , Widget (..)
+-- , widgetConst
+-- -- , buildW
+-- )
+-- where
+
+-- import Data.Sequence (Seq (..))
+
+import Control.Exception (bracket)
+import Control.Monad (void, (<=<))
 import Data.Bifoldable (Bifoldable (..))
 import Data.Bifunctor (Bifunctor (..))
 import Data.Bitraversable (Bitraversable (..))
-import Data.Foldable (foldl', toList, fold)
-import Data.Sequence (Seq (..))
-import qualified Graphics.Vty as V
-import Data.Monoid (First(..))
-import Data.Semigroup (Semigroup(..))
+import Data.Foldable (fold, foldl', toList)
 import Data.List.NonEmpty (NonEmpty (..))
+import Data.Monoid (First (..))
+import Data.Semigroup (Semigroup (..))
+import Graphics.Vty qualified as V
+import Lens.Micro (Lens', lens)
 
 data V2 n = V2 {v2x :: !n, v2y :: !n}
   deriving stock (Eq, Ord, Show)
@@ -41,12 +46,12 @@ data Layout = LayoutHoriz | LayoutVert
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 v2Dim :: Layout -> V2 n -> n
-v2Dim = \case { LayoutHoriz -> v2x ; LayoutVert -> v2y }
+v2Dim = \case LayoutHoriz -> v2x; LayoutVert -> v2y
 
 data Align = AlignBegin | AlignMiddle | AlignEnd
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
-data BoxAlign = BoxAlign { baHoriz :: !Align, baVert :: !Align }
+data BoxAlign = BoxAlign {baHoriz :: !Align, baVert :: !Align}
   deriving stock (Eq, Ord, Show)
 
 data Box n = Box
@@ -54,7 +59,8 @@ data Box n = Box
   , boxTopLeftOff :: !(V2 n)
   , boxContentSize :: !(V2 n)
   , boxBotRightOff :: !(V2 n)
-  } deriving stock (Eq, Ord, Show)
+  }
+  deriving stock (Eq, Ord, Show)
 
 box :: Num n => V2 n -> Box n
 box sz = Box point point sz point
@@ -94,14 +100,20 @@ frame = \case
 frameBox :: Frame n z -> Box n
 frameBox = frameBoxF . unFrame
 
--- frameBoxL :: Lens' (Frame n z) (Box n)
--- frameBoxL = undefined
+setFrameBox :: Frame n z -> Box n -> Frame n z
+setFrameBox (Frame (FrameF _ c)) b = Frame (FrameF b c)
+
+frameBoxL :: Lens' (Frame n z) (Box n)
+frameBoxL = lens frameBox setFrameBox
 
 frameElem :: Frame n z -> Elem (Frame n z) z
 frameElem = frameContentF . unFrame
 
--- frameElemL :: Lens' (Frame n z) (Elem (Frame n z) z)
--- frameElemL = undefined
+setFrameElem :: Frame n z -> Elem (Frame n z) z -> Frame n z
+setFrameElem (Frame (FrameF b _)) c = Frame (FrameF b c)
+
+frameElemL :: Lens' (Frame n z) (Elem (Frame n z) z)
+frameElemL = lens frameElem setFrameElem
 
 frameCata :: (FrameF n (Elem x z) -> x) -> Frame n z -> x
 frameCata f = go where go = f . fmap (first go) . unFrame
@@ -162,7 +174,16 @@ instance Pointed a => Pointed (Either b a) where
 instance Pointed () where
   point = ()
 
-class (Num n, Ord n) => HasSize n a where
+class (Num n, Ord n) => Divisible n where
+  halve :: n -> (n, n)
+
+instance Divisible Int where
+  halve i = let x = div i 2 in (x, i - x)
+
+instance Divisible Double where
+  halve i = let x = i / 2 in (x, i - x)
+
+class Divisible n => HasSize n a where
   getWidth :: a -> n
   getWidth = v2x . getSize
   getHeight :: a -> n
@@ -175,12 +196,12 @@ instance HasSize Int V.Image where
   getWidth = V.imageWidth
   getHeight = V.imageHeight
 
-instance (Num n, Ord n) => HasSize n (V2 n) where
+instance Divisible n => HasSize n (V2 n) where
   getWidth = v2x
   getHeight = v2y
   getSize = id
 
-instance (Num n, Ord n) => HasSize n (Box n) where
+instance Divisible n => HasSize n (Box n) where
   getWidth (Box _ (V2 a _) (V2 b _) (V2 c _)) = a + b + c
   getHeight (Box _ (V2 _ a) (V2 _ b) (V2 _ c)) = a + b + c
 
@@ -202,7 +223,7 @@ instance (HasSize n a, HasSize n b) => HasSize n (Either b a) where
   getHeight = either getHeight getHeight
   getSize = either getSize getSize
 
-instance (Num n, Ord n) => HasSize n () where
+instance Divisible n => HasSize n () where
   getWidth = const 0
   getHeight = const 0
   getSize = const point
@@ -210,14 +231,37 @@ instance (Num n, Ord n) => HasSize n () where
 class Widenable a where
   widen :: a -> a -> (a, a)
 
-instance Ord n => Widenable (V2 n) where
+instance Divisible n => Widenable (V2 n) where
   widen (V2 x1 y1) (V2 x2 y2) = let v = V2 (max x1 x2) (max y1 y2) in (v, v)
 
-instance Widenable (Box n) where
-  widen = undefined
+fitBox :: Divisible n => V2 n -> Box n -> Box n
+fitBox (V2 dx dy) (Box ba@(BoxAlign bax bay) (V2 tlx tly) sz (V2 brx bry)) =
+  let (tlx', brx') = case bax of
+        AlignBegin -> (tlx, brx + dx)
+        AlignMiddle -> let (tld, brd) = halve dx in (tlx + tld, brx + brd)
+        AlignEnd -> (tlx + dx, brx)
+      (tly', bry') = case bay of
+        AlignBegin -> (tly, bry + dy)
+        AlignMiddle -> let (tld, brd) = halve dy in (tly + tld, bry + brd)
+        AlignEnd -> (tly + dy, bry)
+  in  Box ba (V2 tlx' tly') sz (V2 brx' bry')
 
-instance Widenable (Frame n z) where
-  widen = undefined
+instance Divisible n => Widenable (Box n) where
+  widen b1 b2 =
+    let V2 x1 y1 = getSize b1
+        V2 x2 y2 = getSize b2
+        d1 = V2 (max x1 x2 - x1) (max y1 y2 - y1)
+        d2 = V2 (max x1 x2 - x2) (max y1 y2 - y2)
+        b1' = fitBox d1 b1
+        b2' = fitBox d2 b2
+    in  (b1', b2')
+
+instance Divisible n => Widenable (Frame n z) where
+  widen f1 f2 =
+    let b1 = frameBox f1
+        b2 = frameBox f2
+        (b1', b2') = widen b1 b2
+    in  (setFrameBox f1 b1', setFrameBox f2 b2')
 
 class Stackable a where
   hstack :: a -> a -> a
@@ -229,12 +273,12 @@ class Stackable a where
   hcat :: NonEmpty a -> a
   hcat (hd :| tl) = foldl' hstack hd tl
   vcat :: NonEmpty a -> a
-  vcat (hd :| tl)= foldl' vstack hd tl
+  vcat (hd :| tl) = foldl' vstack hd tl
   cat :: Layout -> NonEmpty a -> a
   cat = \case LayoutHoriz -> hcat; LayoutVert -> vcat
   {-# MINIMAL stack | (hstack, vstack) #-}
 
-instance (Num n, Ord n) => Stackable (V2 n) where
+instance Divisible n => Stackable (V2 n) where
   stack l (V2 x1 y1) (V2 x2 y2) =
     case l of
       LayoutHoriz -> V2 (x1 + x2) (max y1 y2)
@@ -246,7 +290,7 @@ instance Stackable V.Image where
   hcat = V.horizCat . toList
   vcat = V.vertCat . toList
 
-instance (Num n, Ord n) => Stackable (Box n) where
+instance Divisible n => Stackable (Box n) where
   stack l b1 b2 = Box point point (stack l (getSize b1) (getSize b2)) point
 
 instance (Pointed z, HasSize n z) => Stackable (Frame n z) where
@@ -256,8 +300,9 @@ instance (Pointed z, HasSize n z) => Stackable (Frame n z) where
         f2' = Frame (FrameF b2' c2)
         b = stack l b1' b2'
         c = ElemLayout l (f1' :| [f2'])
-    in Frame (FrameF b c)
-  -- TODO impl cat
+    in  Frame (FrameF b c)
+
+-- TODO impl cat
 
 newtype Horizontally a = Horizontally {unHorizontally :: a}
 
@@ -299,6 +344,7 @@ buildM f = frameCataM $ \(FrameF _ con) ->
 
 hitBox :: V2 n -> Box n -> Bool
 hitBox = undefined
+
 -- hitBox (Pos hr hc) (Rect (Pos tlr tlc) (Size nr nc)) = hr >= tlr && hr < tlr + nr && hc >= tlc && hc < tlc + nc
 
 hitFrame :: V2 n -> Frame n z -> Maybe z
@@ -316,7 +362,7 @@ data Widget m e n v = Widget
 instance (Applicative m, Pointed v, HasSize n v) => Pointed (Widget m e n v) where
   point = widgetConst point
 
-instance (Num n, Ord n) => HasSize n (Widget m e n v) where
+instance Divisible n => HasSize n (Widget m e n v) where
   getWidth = getWidth . widgetBox
   getHeight = getHeight . widgetBox
   getSize = getSize . widgetBox
@@ -330,3 +376,19 @@ widgetConst v = Widget (box (getSize v)) (const (pure ())) (pure v)
 
 -- buildW :: (Applicative m, Pointed v, HasSize n v) => Frame n (Widget m e n v) -> Widget m e n v
 -- buildW = build id
+
+showI :: Frame Int V.Image -> IO ()
+showI fr = do
+  let im = build id fr
+      pic = V.picForImage im
+  cfg <- V.standardIOConfig
+  bracket (V.mkVty cfg) V.shutdown $ \vty -> do
+    V.update vty pic
+    void (V.nextEvent vty)
+
+testI :: Frame Int V.Image
+testI =
+  let at = V.defAttr
+  in  hstack
+        (vstack (framePart (V.string at "hello")) (framePart (V.string at "world")))
+        (framePart (V.string at ":)"))
