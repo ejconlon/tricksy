@@ -37,7 +37,6 @@ library
       Tricksy.Ref
       Tricksy.Ring
       Tricksy.Rw
-      Tricksy.Termbox
       Tricksy.Time
       Tricksy.Vty
   other-modules:
@@ -76,11 +75,11 @@ library
     , containers
     , deepseq
     , exceptions
+    , microlens
     , mtl
     , primitive
     , resourcet
     , stm
-    , termbox
     , unliftio-core
     , vector
     , vty
@@ -125,13 +124,13 @@ test-suite tricksy-test
     , containers
     , deepseq
     , exceptions
+    , microlens
     , mtl
     , primitive
     , resourcet
     , stm
     , tasty
     , tasty-hunit
-    , termbox
     , tricksy
     , unliftio-core
     , vector

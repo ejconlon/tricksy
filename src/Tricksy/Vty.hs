@@ -1,45 +1,67 @@
 module Tricksy.Vty
-  ( Size (..)
-  , Rect (..)
-  , Layout (..)
+  ( Layout (..)
+  , V2 (..)
+  , Align (..)
+  , BoxAlign
+  , Box (..)
   , Frame
-  , frameRect
+  , frameBox
   , framePart
   , frameMap
   , frameBind
   , Pointed (..)
   , HasSize (..)
-  , Positioned (..)
   , Widenable (..)
   , Stackable (..)
   , Horizontally (..)
   , Vertically (..)
   , build
   , buildM
+  , hitFrame
+  , Widget (..)
+  , widgetConst
+  -- , buildW
   ) where
 
 import Control.Monad ((<=<))
 import Data.Bifoldable (Bifoldable (..))
 import Data.Bifunctor (Bifunctor (..))
 import Data.Bitraversable (Bitraversable (..))
-import Data.Foldable (foldl', toList)
+import Data.Foldable (foldl', toList, fold)
 import Data.Sequence (Seq (..))
-import Graphics.Vty (Image, horizCat, horizJoin, imageHeight, imageWidth, vertCat, vertJoin)
-import Termbox (Pos (..))
+import qualified Graphics.Vty as V
+import Data.Monoid (First(..))
+import Data.Semigroup (Semigroup(..))
+import Data.List.NonEmpty (NonEmpty (..))
 
-data Size = Size {sizeHeight :: !Int, sizeWidth :: !Int}
-  deriving stock (Eq, Ord, Show)
-
-data Rect = Rect {rectTopLeft :: !Pos, rectSize :: !Size}
+data V2 n = V2 {v2x :: !n, v2y :: !n}
   deriving stock (Eq, Ord, Show)
 
 data Layout = LayoutHoriz | LayoutVert
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
--- Seqs are guaranteed nonempty by construction
+v2Dim :: Layout -> V2 n -> n
+v2Dim = \case { LayoutHoriz -> v2x ; LayoutVert -> v2y }
+
+data Align = AlignBegin | AlignMiddle | AlignEnd
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
+
+data BoxAlign = BoxAlign { baHoriz :: !Align, baVert :: !Align }
+  deriving stock (Eq, Ord, Show)
+
+data Box n = Box
+  { boxAlign :: !BoxAlign
+  , boxTopLeftOff :: !(V2 n)
+  , boxContentSize :: !(V2 n)
+  , boxBotRightOff :: !(V2 n)
+  } deriving stock (Eq, Ord, Show)
+
+box :: Num n => V2 n -> Box n
+box sz = Box point point sz point
+
 data Elem r z
   = ElemPart !z
-  | ElemLayout !Layout !(Seq r)
+  | ElemLayout !Layout !(NonEmpty r)
   deriving stock (Eq, Show, Functor, Foldable, Traversable)
 
 instance Bifunctor Elem where
@@ -57,40 +79,46 @@ instance Bitraversable Elem where
     ElemPart z -> fmap ElemPart (g z)
     ElemLayout l rs -> fmap (ElemLayout l) (traverse f rs)
 
-data FrameF r = FrameF {frameRectF :: !Rect, frameContentF :: !r}
+data FrameF n r = FrameF {frameBoxF :: !(Box n), frameContentF :: !r}
   deriving stock (Eq, Ord, Show, Functor, Foldable, Traversable)
 
-newtype Frame z = Frame {unFrame :: FrameF (Elem (Frame z) z)}
+newtype Frame n z = Frame {unFrame :: FrameF n (Elem (Frame n z) z)}
   deriving stock (Show)
-  deriving newtype (Eq, Pointed, HasSize, Positioned)
+  deriving newtype (Eq, Pointed, HasSize n)
 
-frame :: (Pointed z, HasSize z) => Elem (Frame z) z -> Frame z
+frame :: (Pointed z, HasSize n z) => Elem (Frame n z) z -> Frame n z
 frame = \case
   ElemPart z -> framePart z
   ElemLayout l fs -> cat l fs
 
-frameRect :: Frame z -> Rect
-frameRect = frameRectF . unFrame
+frameBox :: Frame n z -> Box n
+frameBox = frameBoxF . unFrame
 
-frameElem :: Frame z -> Elem (Frame z) z
+-- frameBoxL :: Lens' (Frame n z) (Box n)
+-- frameBoxL = undefined
+
+frameElem :: Frame n z -> Elem (Frame n z) z
 frameElem = frameContentF . unFrame
 
-frameCata :: (FrameF (Elem x z) -> x) -> Frame z -> x
+-- frameElemL :: Lens' (Frame n z) (Elem (Frame n z) z)
+-- frameElemL = undefined
+
+frameCata :: (FrameF n (Elem x z) -> x) -> Frame n z -> x
 frameCata f = go where go = f . fmap (first go) . unFrame
 
-frameCataM :: Monad m => (FrameF (Elem x z) -> m x) -> Frame z -> m x
+frameCataM :: Monad m => (FrameF n (Elem x z) -> m x) -> Frame n z -> m x
 frameCataM f = go where go = f <=< traverse (bitraverse go pure) . unFrame
 
-framePart :: HasSize z => z -> Frame z
-framePart z = Frame (FrameF (Rect point (getSize z)) (ElemPart z))
+framePart :: HasSize n z => z -> Frame n z
+framePart z = Frame (FrameF (box (getSize z)) (ElemPart z))
 
-frameMap :: (Pointed w, HasSize w) => (z -> w) -> Frame z -> Frame w
+frameMap :: (Pointed w, HasSize o w) => (z -> w) -> Frame n z -> Frame o w
 frameMap f = frameCata (frame . fmap f . frameContentF)
 
-frameBind :: (Pointed w, HasSize w) => (z -> Frame w) -> Frame z -> Frame w
+frameBind :: (Pointed w, HasSize o w) => (z -> Frame o w) -> Frame n z -> Frame o w
 frameBind f = frameCata (elemBind f . frameContentF)
 
-elemBind :: (Pointed w, HasSize w) => (z -> Frame w) -> Elem (Frame w) z -> Frame w
+elemBind :: (Pointed w, HasSize o w) => (z -> Frame o w) -> Elem (Frame o w) z -> Frame o w
 elemBind f = \case
   ElemPart z -> f z
   ElemLayout l fs -> cat l fs
@@ -98,22 +126,31 @@ elemBind f = \case
 class Pointed a where
   point :: a
 
-instance Pointed Image where
+instance Pointed V.Image where
   point = mempty
 
-instance Pointed Pos where
-  point = Pos 0 0
+instance Num n => Pointed (V2 n) where
+  point = V2 0 0
 
-instance Pointed Size where
-  point = Size 0 0
+instance Pointed Int where
+  point = 0
 
-instance Pointed Rect where
-  point = Rect point point
+instance Pointed Double where
+  point = 0
+
+instance Pointed Align where
+  point = AlignBegin
+
+instance Pointed BoxAlign where
+  point = BoxAlign point point
+
+instance Num n => Pointed (Box n) where
+  point = Box point point point point
 
 instance Pointed z => Pointed (Elem r z) where
   point = ElemPart point
 
-instance Pointed a => Pointed (FrameF a) where
+instance (Pointed z, Num n) => Pointed (FrameF n z) where
   point = FrameF point point
 
 instance Pointed (Maybe a) where
@@ -125,155 +162,171 @@ instance Pointed a => Pointed (Either b a) where
 instance Pointed () where
   point = ()
 
-class HasSize a where
-  getWidth :: a -> Int
-  getWidth = sizeWidth . getSize
-  getHeight :: a -> Int
-  getHeight = sizeHeight . getSize
-  getSize :: a -> Size
-  getSize a = Size (getWidth a) (getHeight a)
+class (Num n, Ord n) => HasSize n a where
+  getWidth :: a -> n
+  getWidth = v2x . getSize
+  getHeight :: a -> n
+  getHeight = v2y . getSize
+  getSize :: a -> V2 n
+  getSize a = V2 (getWidth a) (getHeight a)
   {-# MINIMAL (getWidth, getHeight) | getSize #-}
 
-instance HasSize Image where
-  getWidth = imageWidth
-  getHeight = imageHeight
+instance HasSize Int V.Image where
+  getWidth = V.imageWidth
+  getHeight = V.imageHeight
 
-instance HasSize Size where
-  getWidth = sizeWidth
-  getHeight = sizeHeight
+instance (Num n, Ord n) => HasSize n (V2 n) where
+  getWidth = v2x
+  getHeight = v2y
   getSize = id
 
-instance HasSize Rect where
-  getSize = rectSize
+instance (Num n, Ord n) => HasSize n (Box n) where
+  getWidth (Box _ (V2 a _) (V2 b _) (V2 c _)) = a + b + c
+  getHeight (Box _ (V2 _ a) (V2 _ b) (V2 _ c)) = a + b + c
 
-instance (HasSize r, HasSize z) => HasSize (Elem r z) where
+instance (HasSize n r, HasSize n z) => HasSize n (Elem r z) where
   getSize = \case
     ElemPart z -> getSize z
-    ElemLayout l as -> cat l (fmap getSize (toList as))
+    ElemLayout l as -> cat l (fmap getSize as)
 
-instance HasSize a => HasSize (FrameF a) where
-  getSize = getSize . frameRectF
+instance HasSize n a => HasSize n (FrameF n a) where
+  getSize = getSize . frameBoxF
 
-instance HasSize a => HasSize (Maybe a) where
+instance HasSize n a => HasSize n (Maybe a) where
   getWidth = maybe 0 getWidth
   getHeight = maybe 0 getHeight
   getSize = maybe point getSize
 
-instance (HasSize a, HasSize b) => HasSize (Either b a) where
+instance (HasSize n a, HasSize n b) => HasSize n (Either b a) where
   getWidth = either getWidth getWidth
   getHeight = either getHeight getHeight
   getSize = either getSize getSize
 
-instance HasSize () where
+instance (Num n, Ord n) => HasSize n () where
   getWidth = const 0
   getHeight = const 0
   getSize = const point
 
-class Positioned a where
-  position :: a -> Pos
-  translate :: Pos -> a -> a
+class Widenable a where
+  widen :: a -> a -> (a, a)
 
-instance Positioned Pos where
-  position = id
-  translate (Pos r1 c1) (Pos r2 c2) = Pos (r1 + r2) (c1 + c2)
+instance Ord n => Widenable (V2 n) where
+  widen (V2 x1 y1) (V2 x2 y2) = let v = V2 (max x1 x2) (max y1 y2) in (v, v)
 
-instance Positioned Rect where
-  position = rectTopLeft
-  translate byPos (Rect tl sz) = Rect (translate byPos tl) sz
-
-instance Positioned (FrameF z) where
-  position = position . frameRectF
-  translate byPos (FrameF (Rect pos sz) con) = FrameF (Rect (translate byPos pos) sz) con
-
-boundingBox :: (Positioned a, HasSize a) => a -> Rect
-boundingBox a = Rect (position a) (getSize a)
-
-class HasSize a => Widenable a where
-  hwiden :: Int -> a -> a
-  hwiden = widen LayoutHoriz
-  vwiden :: Int -> a -> a
-  vwiden = widen LayoutVert
-  widen :: Layout -> Int -> a -> a
-  widen = \case LayoutHoriz -> hwiden; LayoutVert -> vwiden
-  {-# MINIMAL widen | (hwiden, vwiden) #-}
-
-pwiden :: Widenable a => Layout -> Pos -> a -> a
-pwiden l (Pos r c) = widen l (case l of LayoutHoriz -> r; LayoutVert -> c)
-
-instance Widenable Size where
-  widen l x (Size r c) =
-    case l of
-      LayoutHoriz -> Size r (x + c)
-      LayoutVert -> Size (r + x) c
-
-instance Widenable Rect where
-  widen l x (Rect p s) = Rect p (widen l x s)
-
-instance Widenable a => Widenable (FrameF a) where
-  -- widen l x (Frame (FrameF r s)) = Frame (FrameF _ _)
+instance Widenable (Box n) where
   widen = undefined
 
-class Pointed a => Stackable a where
+instance Widenable (Frame n z) where
+  widen = undefined
+
+class Stackable a where
   hstack :: a -> a -> a
   hstack = stack LayoutHoriz
   vstack :: a -> a -> a
   vstack = stack LayoutVert
-  hcat :: Foldable f => f a -> a
-  hcat = foldl' hstack point
-  vcat :: Foldable f => f a -> a
-  vcat = foldl' vstack point
   stack :: Layout -> a -> a -> a
   stack = \case LayoutHoriz -> hstack; LayoutVert -> vstack
-  cat :: Foldable f => Layout -> f a -> a
+  hcat :: NonEmpty a -> a
+  hcat (hd :| tl) = foldl' hstack hd tl
+  vcat :: NonEmpty a -> a
+  vcat (hd :| tl)= foldl' vstack hd tl
+  cat :: Layout -> NonEmpty a -> a
   cat = \case LayoutHoriz -> hcat; LayoutVert -> vcat
   {-# MINIMAL stack | (hstack, vstack) #-}
 
-instance Stackable Size where
-  stack l (Size h1 w1) (Size h2 w2) =
+instance (Num n, Ord n) => Stackable (V2 n) where
+  stack l (V2 x1 y1) (V2 x2 y2) =
     case l of
-      LayoutHoriz -> Size (max h1 h2) (w1 + w2)
-      LayoutVert -> Size (h1 + h2) (max w1 w2)
+      LayoutHoriz -> V2 (x1 + x2) (max y1 y2)
+      LayoutVert -> V2 (max x1 x2) (y1 + y2)
 
-instance Stackable Image where
-  hstack = horizJoin
-  vstack = vertJoin
-  hcat = horizCat . toList
-  vcat = vertCat . toList
+instance Stackable V.Image where
+  hstack = V.horizJoin
+  vstack = V.vertJoin
+  hcat = V.horizCat . toList
+  vcat = V.vertCat . toList
 
-instance Stackable Rect where
-  stack l (Rect p1 s1) (Rect p s2) = Rect p1 (stack l s1 (pwiden l p s2))
+instance (Num n, Ord n) => Stackable (Box n) where
+  stack l b1 b2 = Box point point (stack l (getSize b1) (getSize b2)) point
 
-instance (Pointed z, HasSize z) => Stackable (Frame z) where
-  stack l f1 f2 = undefined
+instance (Pointed z, HasSize n z) => Stackable (Frame n z) where
+  stack l (Frame (FrameF b1 c1)) (Frame (FrameF b2 c2)) =
+    let (b1', b2') = widen b1 b2
+        f1' = Frame (FrameF b1' c1)
+        f2' = Frame (FrameF b2' c2)
+        b = stack l b1' b2'
+        c = ElemLayout l (f1' :| [f2'])
+    in Frame (FrameF b c)
+  -- TODO impl cat
 
 newtype Horizontally a = Horizontally {unHorizontally :: a}
 
 instance Stackable a => Semigroup (Horizontally a) where
   Horizontally x <> Horizontally y = Horizontally (hstack x y)
+  sconcat = Horizontally . hcat . fmap unHorizontally
 
-instance Stackable a => Monoid (Horizontally a) where
+instance (Pointed a, Stackable a) => Monoid (Horizontally a) where
   mempty = Horizontally point
   mappend = (<>)
-  mconcat = Horizontally . hcat . fmap unHorizontally
+  mconcat = \case
+    [] -> Horizontally point
+    x : xs -> sconcat (x :| xs)
 
 newtype Vertically a = Vertically {unVertically :: a}
 
 instance Stackable a => Semigroup (Vertically a) where
   Vertically x <> Vertically y = Vertically (vstack x y)
+  sconcat = Vertically . vcat . fmap unVertically
 
-instance Stackable a => Monoid (Vertically a) where
+instance (Pointed a, Stackable a) => Monoid (Vertically a) where
   mempty = Vertically point
   mappend = (<>)
-  mconcat = Vertically . vcat . fmap unVertically
+  mconcat = \case
+    [] -> Vertically point
+    x : xs -> sconcat (x :| xs)
 
-build :: Stackable w => (z -> w) -> Frame z -> w
+build :: Stackable w => (z -> w) -> Frame n z -> w
 build f = frameCata $ \(FrameF _ e) ->
   case e of
     ElemPart z -> f z
     ElemLayout l ws -> cat l ws
 
-buildM :: (Monad m, Stackable w) => (z -> m w) -> Frame z -> m w
-buildM f = frameCataM $ \(FrameF _ e) ->
-  case e of
+buildM :: (Monad m, Stackable w) => (z -> m w) -> Frame n z -> m w
+buildM f = frameCataM $ \(FrameF _ con) ->
+  case con of
     ElemPart z -> f z
     ElemLayout l ws -> pure (cat l ws)
+
+hitBox :: V2 n -> Box n -> Bool
+hitBox = undefined
+-- hitBox (Pos hr hc) (Rect (Pos tlr tlc) (Size nr nc)) = hr >= tlr && hr < tlr + nr && hc >= tlc && hc < tlc + nc
+
+hitFrame :: V2 n -> Frame n z -> Maybe z
+hitFrame pos fr = getFirst $ flip frameCata fr $ \(FrameF bx con) ->
+  case con of
+    ElemPart z -> First (if hitBox pos bx then Just z else Nothing)
+    ElemLayout _ fs -> fold fs
+
+data Widget m e n v = Widget
+  { widgetBox :: !(Box n)
+  , widgetCallback :: !(e -> m ())
+  , widgetView :: !(m v)
+  }
+
+instance (Applicative m, Pointed v, HasSize n v) => Pointed (Widget m e n v) where
+  point = widgetConst point
+
+instance (Num n, Ord n) => HasSize n (Widget m e n v) where
+  getWidth = getWidth . widgetBox
+  getHeight = getHeight . widgetBox
+  getSize = getSize . widgetBox
+
+-- instance (Applicative m, Pointed v, HasSize n v) => Stackable (Widget m e n v) where
+--   stack l (Widget b1 cb1 v1) (Widget b2 cb2 v2) = Widget b cb v where
+--     b =
+
+widgetConst :: (Applicative m, HasSize n v) => v -> Widget m e n v
+widgetConst v = Widget (box (getSize v)) (const (pure ())) (pure v)
+
+-- buildW :: (Applicative m, Pointed v, HasSize n v) => Frame n (Widget m e n v) -> Widget m e n v
+-- buildW = build id

@@ -26,9 +26,9 @@ dependencies:
 - unliftio-core
 - primitive
 - exceptions
-- termbox
 - vector
 - vty
+- microlens
 
 default-extensions:
 - BangPatterns
