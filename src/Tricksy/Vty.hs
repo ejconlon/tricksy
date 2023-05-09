@@ -1,6 +1,8 @@
 -- TODO frame zippers for dom-style capturing/bubbling?
 -- TODO focus tracking
 -- TODO explicit exports
+-- TODO widgets
+-- TODO ui events
 module Tricksy.Vty where
 
 import Control.Exception (bracket)
@@ -24,25 +26,6 @@ class Monoid n => Group n where
 instance Num n => Group (Sum n) where
   invert (Sum n) = Sum (negate n)
 
--- -- | Numbers extended with an "undefined" point
--- newtype Ext n = Ext { unExt :: Maybe n }
---   deriving stock (Show)
---   deriving newtype (Eq, Ord)
-
--- instance Semigroup n => Semigroup (Ext n) where
---   ea <> eb = case unExt ea of
---     Nothing -> eb
---     Just a -> case unExt eb of
---       Nothing -> ea
---       Just b -> Ext (Just (a <> b))
-
--- instance Semigroup n => Monoid (Ext n) where
---   mempty = Ext Nothing
---   mappend = (<>)
-
--- instance Group n => Group (Ext n) where
---   invert (Ext mn) = Ext (fmap invert mn)
-
 class (Num n, Ord n) => NumHalvable n where
   halveNum :: n -> (n, n)
 
@@ -58,13 +41,7 @@ class (Monoid n, Ord n) => Halvable n where
 instance NumHalvable n => Halvable (Sum n) where
   halve (Sum n) = let (x, y) = halveNum n in (Sum x, Sum y)
 
--- instance Halvable n => Halvable (Ext n) where
---   halve en@(Ext mn) =
---     case mn of
---       Nothing -> (en, en)
---       Just n -> let (x, y) = halve n in (Ext (Just x), Ext (Just y))
-
-type Domain n = (Halvable n, Group n, Ord n)
+type SizeLike n = (Halvable n, Group n, Ord n)
 
 data V2 n = V2 {v2X :: !n, v2Y :: !n}
   deriving stock (Eq, Ord, Show)
@@ -139,7 +116,7 @@ newtype Frame n b z = Frame {unFrame :: FrameF n (Elem b (Frame n b z) z)}
   deriving stock (Show)
   deriving newtype (Eq, Ord)
 
-frame :: (Domain n, HasSize n z, HasFill n b) => Elem b (Frame n b z) z -> Frame n b z
+frame :: (SizeLike n, HasSize n z, HasFill n b) => Elem b (Frame n b z) z -> Frame n b z
 frame = \case
   ElemPart z -> framePart z
   ElemLayout ly bo fs -> cat ly bo fs
@@ -171,23 +148,16 @@ frameCataM f = go where go = f <=< traverse (bitraverse go pure) . unFrame
 framePart :: (Monoid n, HasSize n z) => z -> Frame n b z
 framePart z = Frame (FrameF (box (getSize z)) (ElemPart z))
 
-frameMap :: (Domain n, HasSize n w, HasFill n b) => (z -> w) -> Frame n b z -> Frame n b w
+frameMap :: (SizeLike n, HasSize n w, HasFill n b) => (z -> w) -> Frame n b z -> Frame n b w
 frameMap f = frameCata (frame . fmap f . frameContentF)
 
-frameBind :: (Domain n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Frame n b z -> Frame n b w
+frameBind :: (SizeLike n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Frame n b z -> Frame n b w
 frameBind f = frameCata (elemBind f . frameContentF)
 
-elemBind :: (Domain n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Elem b (Frame n b w) z -> Frame n b w
+elemBind :: (SizeLike n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Elem b (Frame n b w) z -> Frame n b w
 elemBind f = \case
   ElemPart z -> f z
   ElemLayout ly bo fs -> cat ly bo fs
-
--- -- | Represents a single "pane" in a frame.
--- data Pane n =
---     PaneEmpty
---   | PaneBorder !Layout
---   | PaneImage !V.Image
---   deriving stock (Eq)
 
 newtype ImBorder = ImBorder {unImBorder :: Bool}
   deriving stock (Show)
@@ -214,14 +184,6 @@ class HasSize n a where
 instance HasSize (Sum Int) V.Image where
   getWidth = Sum . V.imageWidth
   getHeight = Sum . V.imageHeight
-
--- instance HasSize (Maybe Int) Pane where
---   getWidth = \case
---     PaneEmpty -> Nothing
---     PaneBorder ly ->
---       case ly of
---         LayoutHoriz -> Nothing
---         LayoutVert -> Just
 
 instance HasSize n (V2 n) where
   getWidth = v2X
@@ -266,7 +228,7 @@ fitBox (V2 dx dy) (Box ba@(BoxAlign bax bay) (V2 tlx tly) sz (V2 brx bry)) =
         AlignEnd -> (tly <> dy, bry)
   in  Box ba (V2 tlx' tly') sz (V2 brx' bry')
 
-instance Domain n => Widenable (Box n) where
+instance SizeLike n => Widenable (Box n) where
   widen ly b1 b2 =
     let V2 x1 y1 = getSize b1
         V2 x2 y2 = getSize b2
@@ -285,7 +247,7 @@ instance Domain n => Widenable (Box n) where
         b2' = fitBox d2 b2
     in  (b1', b2')
 
-instance Domain n => Widenable (Frame n b z) where
+instance SizeLike n => Widenable (Frame n b z) where
   widen ly f1 f2 =
     let b1 = frameBox f1
         b2 = frameBox f2
@@ -324,7 +286,7 @@ instance (Monoid n, Ord n, HasFill n b) => Stackable b (Box n) where
   stack ly bo b1 b2 = Box defBoxAlign mempty (stack ly bo (getSize b1) (getSize b2)) mempty
 
 -- TODO impl cat to reduce tree depth
-instance (Domain n, HasSize n z, HasFill n b) => Stackable b (Frame n b z) where
+instance (SizeLike n, HasSize n z, HasFill n b) => Stackable b (Frame n b z) where
   stack ly bo (Frame (FrameF b1 c1)) (Frame (FrameF b2 c2)) =
     let (b1', b2') = widen ly b1 b2
         f1' = Frame (FrameF b1' c1)
@@ -403,25 +365,22 @@ testI at =
         (vstack bo (framePart (V.string at "hello")) (framePart (V.string at "world")))
         (framePart (V.string at ":)"))
 
--- data Widget m e n v = Widget
---   { widgetBox :: !(Box n)
---   , widgetCallback :: !(e -> m ())
---   , widgetView :: !v
---   }
+data Widget m e n v = Widget
+  { widgetBox :: !(Box n)
+  , widgetCallback :: !(e -> m ())
+  , widgetView :: !(m v)
+  }
 
--- instance (Applicative m, Pointed v, Num n, HasSize n v) => Pointed (Widget m e n v) where
---   point = widgetConst point
+instance Monoid n => HasSize n (Widget m e n v) where
+  getWidth = getWidth . widgetBox
+  getHeight = getHeight . widgetBox
+  getSize = getSize . widgetBox
 
--- instance Num n => HasSize n (Widget m e n v) where
---   getWidth = getWidth . widgetBox
---   getHeight = getHeight . widgetBox
---   getSize = getSize . widgetBox
+widgetPure :: (Applicative m, Monoid n, HasSize n v) => v -> Widget m e n v
+widgetPure v = Widget (box (getSize v)) (const (pure ())) (pure v)
 
--- instance (Applicative m, Pointed v, HasSize n v) => Stackable (Widget m e n v) where
+-- instance (Applicative m, HasSize n v) => Stackable (Widget m e n v) where
 --   stack l (Widget b1 cb1 v1) (Widget b2 cb2 v2) = Widget b cb v where
 
--- widgetConst :: (Applicative m, Num n, HasSize n v) => v -> Widget m e n v
--- widgetConst v = Widget (box (getSize v)) (const (pure ())) (pure v)
-
--- buildW :: (Applicative m, Pointed v, HasSize n v) => Frame n (Widget m e n v) -> Widget m e n v
--- buildW = build id
+-- buildW :: (Applicative m, HasSize n v) => Frame n (Widget m e n v) -> Widget m e n v
+-- buildW = build onBorder onContent where
