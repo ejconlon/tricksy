@@ -29,6 +29,7 @@ dependencies:
 - vector
 - vty
 - microlens
+- pretty-show
 
 default-extensions:
 - BangPatterns
