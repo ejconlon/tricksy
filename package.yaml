@@ -30,6 +30,8 @@ dependencies:
 - vty
 - microlens
 - pretty-show
+- transformers
+- text
 
 default-extensions:
 - BangPatterns

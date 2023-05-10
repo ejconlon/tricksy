@@ -81,6 +81,8 @@ library
     , primitive
     , resourcet
     , stm
+    , text
+    , transformers
     , unliftio-core
     , vector
     , vty
@@ -133,6 +135,8 @@ test-suite tricksy-test
     , stm
     , tasty
     , tasty-hunit
+    , text
+    , transformers
     , tricksy
     , unliftio-core
     , vector
