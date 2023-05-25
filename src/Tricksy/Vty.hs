@@ -8,8 +8,8 @@ module Tricksy.Vty where
 import Control.Applicative (Alternative (..), liftA2)
 import Control.Exception (bracket)
 import Control.Monad (void, when, (<=<))
-import Control.Monad.Reader (MonadReader (..), ReaderT (..), asks, runReader)
-import Control.Monad.State.Strict (MonadState (..), State, StateT (..), gets, modify', runState)
+import Control.Monad.Reader (MonadReader (..), asks, runReader)
+import Control.Monad.State.Strict (MonadState (..), StateT (..), gets, modify')
 import Control.Monad.Trans (MonadTrans (..))
 import Control.Monad.Trans.Maybe (MaybeT (..))
 import Data.Bifoldable (Bifoldable (..))
@@ -27,7 +27,20 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
 import Graphics.Vty qualified as V
-import Lens.Micro (Lens', lens)
+import Lens.Micro (Lens', lens, set)
+import Lens.Micro.Extras (view)
+
+using :: MonadState s m => Lens' s a -> m a
+using l = gets (view l)
+
+usingAs :: MonadState s m => Lens' s a -> (a -> b) -> m b
+usingAs l f = gets (f . view l)
+
+modifying :: MonadState s m => Lens' s a -> (a -> a) -> m ()
+modifying l f = modify' (\s -> let a' = f (view l s) in set l a' s)
+
+stating :: MonadState s m => Lens' s a -> (a -> (b, a)) -> m b
+stating l f = state (\s -> let (b, a') = f (view l s) in (b, set l a' s))
 
 class Monoid n => Group n where
   invert :: n -> n
@@ -446,28 +459,37 @@ data Focus n = Focus
   }
   deriving stock (Eq, Ord, Show)
 
-data Camera n = Camera
-  { camRoot :: !Id
-  , camFocus :: !(Maybe (Focus n))
+data CameraSt n = CameraSt
+  { csRoot :: !Id
+  , csFocus :: !(Maybe (Focus n))
   }
   deriving stock (Eq, Ord, Show)
 
-data St n b z = St
-  { stNextId :: !Id
-  , stFrames :: !(Map Id (IdFrame n b z))
-  -- , stCamera :: !(Maybe (Camera n))
+class HasCameraSt n s | s -> n where
+  cameraStL :: Lens' s (CameraSt n)
+
+instance HasCameraSt n (CameraSt n) where
+  cameraStL = id
+
+type MonadCameraSt n s m = (MonadState s m, HasCameraSt n s)
+
+data FrameSt n b z = FrameSt
+  { fsNextId :: !Id
+  , fsFrames :: !(Map Id (IdFrame n b z))
   }
   deriving stock (Eq, Ord, Show)
 
-newtype M n b z a = M {unM :: State (St n b z) a}
-  deriving newtype (Functor, Applicative, Monad, MonadState (St n b z))
+class HasFrameSt n b z s | s -> n b z where
+  frameStL :: Lens' s (FrameSt n b z)
 
-runM :: M n b z a -> St n b z -> (a, St n b z)
-runM = runState . unM
+instance HasFrameSt n b z (FrameSt n b z) where
+  frameStL = id
 
-addFrameF :: IdFrame n b z -> M n b z Id
-addFrameF r =
-  state (\(St k m) -> (k, St {stNextId = succ k, stFrames = Map.insert k r m}))
+type MonadFrameSt n b z s m = (MonadState s m, HasFrameSt n b z s)
+
+addFrameF :: MonadFrameSt n b z s m => IdFrame n b z -> m Id
+addFrameF r = stating frameStL $ \(FrameSt k m) ->
+  (k, FrameSt (succ k) (Map.insert k r m))
 
 foldState :: (s -> a -> (b, s)) -> s -> Seq a -> (Seq b, s)
 foldState f = go Empty
@@ -485,11 +507,11 @@ addOffset (FrameF bx c) = FrameF bx (goElem c)
       ElemLayout ly bo (Ref r mempty) (fst (foldState (goFold (layoutOffset bx ly bo)) mempty rs))
   goFold layOff off i = let off' = off <> layOff in (Ref i off', off')
 
-addFrame :: (Group n, HasFill n b) => Frame n b z -> M n b z Id
+addFrame :: (Group n, HasFill n b, MonadFrameSt n b z s m) => Frame n b z -> m Id
 addFrame = frameCataM (addFrameF . addOffset)
 
-lookupFrame :: Id -> M n b z (Maybe (IdFrame n b z))
-lookupFrame i = gets (Map.lookup i . stFrames)
+lookupFrame :: MonadFrameSt n b z s m => Id -> m (Maybe (IdFrame n b z))
+lookupFrame i = gets (Map.lookup i . fsFrames . view frameStL)
 
 newtype X m a = X {unX :: StateT (Set Id) (MaybeT m) a}
   deriving newtype (Functor, Applicative, Monad, MonadState (Set Id), Alternative)
@@ -503,7 +525,7 @@ runX x s = runMaybeT (runStateT (unX x) s)
 evalX :: Functor m => X m a -> m (Maybe a)
 evalX x = fmap (fmap fst) (runX x Set.empty)
 
-extractFrame :: Id -> M n b z (Maybe (Frame n b z))
+extractFrame :: MonadFrameSt n b z s m => Id -> m (Maybe (Frame n b z))
 extractFrame = fmap (fmap Frame) . evalX . go
  where
   go i = do
@@ -518,21 +540,25 @@ extractFrame = fmap (fmap Frame) . evalX . go
             modify' (Set.insert i)
             traverse (bitraverse (fmap Frame . go . refId) pure) r
 
--- hitFrameM :: (Semigroup n, Ord n) => V2 n -> M n b z (Maybe (Id, IdFrame n b z))
--- hitFrameM pos = runMaybeT goRoot where
---   goRoot = do
---     q <- MaybeT (gets (fmap camRoot . stCamera))
---     goSearch Nothing (Seq.singleton q)
---   goSearch best = \case
---     Empty -> maybe empty pure best
---     q :<| rest -> do
---       r@(FrameF bx c) <- MaybeT (lookupFrame q)
---       let p = (q, r)
---       if hitBox pos bx
---         then case c of
---           ElemPart _ -> pure p
---           ElemLayout _ _ s ss -> goSearch (Just p) (s :<| (ss <> rest))
---         else goSearch (Just p) rest
+data BorderHit b = BorderHit !Layout !b !Int
+
+type FrameHit n b z = FrameF n (Either (BorderHit b) z)
+
+-- hitFrameM :: (Semigroup n, Ord n, MonadFrameSt n b z s m) => V2 n -> Id -> m (Maybe (Id, FrameHit n b z))
+-- hitFrameM pos0 q0 = runMaybeT (go Nothing Empty pos0 q0)
+--  where
+--   go best rest pos q = do
+--     r@(FrameF bx c) <- MaybeT (lookupFrame q)
+--     let p = (q, r)
+--     if hitBox pos bx
+--       then case c of
+--         ElemPart _ -> pure p
+--         ElemLayout ly bo s ss ->
+--           let layOff = layoutOffset bx ly bo
+--           in  error "TODO"
+--       else case rest of
+--         Empty -> pure best
+--         (pos', q') :<| rest' -> go best rest' pos' q'
 
 -- data Dir = DirLeft | DirRight | DirUp | DirDown
 --   deriving stock (Eq, Ord, Show)
