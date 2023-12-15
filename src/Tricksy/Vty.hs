@@ -30,6 +30,8 @@ import Graphics.Vty qualified as V
 import Lens.Micro (Lens', lens, set)
 import Lens.Micro.Extras (view)
 
+-- Various lens helpers
+
 using :: MonadState s m => Lens' s a -> m a
 using l = gets (view l)
 
@@ -41,6 +43,10 @@ modifying l f = modify' (\s -> let a' = f (view l s) in set l a' s)
 
 stating :: MonadState s m => Lens' s a -> (a -> (b, a)) -> m b
 stating l f = state (\s -> let (b, a') = f (view l s) in (b, set l a' s))
+
+-- We need to settle on numeric types to represent points - integral for
+-- CLI use; decimal for other purposes. We can get by with anything we
+-- can add, subtract, and halve.
 
 class Monoid n => Group n where
   invert :: n -> n
@@ -56,7 +62,13 @@ class (Num n, Ord n) => NumHalvable n where
 instance NumHalvable Int where
   halveNum i = let x = div i 2 in (x, i - x)
 
+instance NumHalvable Integer where
+  halveNum i = let x = div i 2 in (x, i - x)
+
 instance NumHalvable Double where
+  halveNum i = let x = i / 2 in (x, i - x)
+
+instance NumHalvable Rational where
   halveNum i = let x = i / 2 in (x, i - x)
 
 class (Monoid n, Ord n) => Halvable n where
@@ -67,6 +79,7 @@ instance NumHalvable n => Halvable (Sum n) where
 
 type SizeLike n = (Halvable n, Group n, Ord n)
 
+-- A 2D vector
 data V2 n = V2 {v2X :: !n, v2Y :: !n}
   deriving stock (Eq, Ord, Show)
 
@@ -86,6 +99,9 @@ instance Halvable n => Halvable (V2 n) where
         (y1, y2) = halve y
     in  (V2 x1 y1, V2 x2 y2)
 
+-- Our layout is based on n-ary trees of boxes grouped horizontally
+-- or vertically for each layer with justified contents.
+
 data Layout = LayoutHoriz | LayoutVert
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
@@ -100,50 +116,83 @@ defBoxAlign = BoxAlign AlignBegin AlignBegin
 
 data Box n = Box
   { boxAlign :: !BoxAlign
+  -- ^ Alignment of children
   , boxTopLeftOff :: !(V2 n)
+  -- ^ Offset from top left corner of self to same of content
   , boxContentSize :: !(V2 n)
+  -- ^ Size of contents
   , boxBotRightOff :: !(V2 n)
+  -- ^ Offset from bottom right corner of content to same of self
   }
   deriving stock (Eq, Ord, Show)
 
 box :: Monoid n => V2 n -> Box n
 box sz = Box defBoxAlign mempty sz mempty
 
+-- A box's size includes padding, so it's no smaller than its content's size
 boxSize :: Semigroup n => Box n -> V2 n
 boxSize (Box _ (V2 tlx tly) (V2 cx cy) (V2 brx bry)) =
   V2 (tlx <> cx <> brx) (tly <> cy <> bry)
 
-data Elem b r z
+-- Content of a single level of our layout tree. Either an element of our
+-- domain or a layout
+-- [@b@] The type of border
+-- [@z@] The type of element
+-- [@r@] The recursive type (Frame, which contains more elems)
+data Elem b z r
   = ElemPart !z
   | ElemLayout !Layout !b !r !(Seq r)
   deriving stock (Eq, Ord, Show, Functor, Foldable, Traversable)
 
 instance Bifunctor (Elem b) where
   bimap f g = \case
-    ElemPart z -> ElemPart (g z)
-    ElemLayout ly bo r rs -> ElemLayout ly bo (f r) (fmap f rs)
+    ElemPart z -> ElemPart (f z)
+    ElemLayout ly bo r rs -> ElemLayout ly bo (g r) (fmap g rs)
 
 instance Bifoldable (Elem b) where
   bifoldr f g x = \case
-    ElemPart z -> g z x
-    ElemLayout _ _ r rs -> f r (foldr f x rs)
+    ElemPart z -> f z x
+    ElemLayout _ _ r rs -> g r (foldr g x rs)
 
 instance Bitraversable (Elem b) where
   bitraverse f g = \case
-    ElemPart z -> fmap ElemPart (g z)
-    ElemLayout ly bo r rs -> liftA2 (ElemLayout ly bo) (f r) (traverse f rs)
+    ElemPart z -> fmap ElemPart (f z)
+    ElemLayout ly bo r rs -> liftA2 (ElemLayout ly bo) (g r) (traverse g rs)
 
-data FrameF n r = FrameF {frameBoxF :: !(Box n), frameContentF :: !r}
+-- A single level of our layout tree. Pairs contents with a bounding box.
+-- Invariant: The bounding box contains the boxes of its children.
+-- [@n@] The type numeric type for boxes
+-- [@r@] The recursive type (Frame)
+data FrameF n b z r = FrameF {frameBoxF :: !(Box n), frameContentF :: !(Elem b z r) }
   deriving stock (Eq, Ord, Show, Functor, Foldable, Traversable)
 
-newtype Frame n b z = Frame {unFrame :: FrameF n (Elem b (Frame n b z) z)}
+instance Bifunctor (FrameF n b) where
+  bimap f g = undefined
+
+instance Bifoldable (FrameF n b) where
+  bifoldr f g x = undefined
+
+instance Bitraversable (FrameF n b) where
+  bitraverse f g = undefined
+
+-- The knot tying our layout tree together.
+newtype Frame n b z = Frame {unFrame :: FrameF n b z (Frame n b z)}
   deriving stock (Show)
   deriving newtype (Eq, Ord)
 
-frame :: (SizeLike n, HasSize n z, HasFill n b) => Elem b (Frame n b z) z -> Frame n b z
+-- Smart constructor for frames from elements
+frame :: (SizeLike n, HasSize n z, HasFill n b) => Elem b z (Frame n b z) -> Frame n b z
 frame = \case
   ElemPart z -> framePart z
   ElemLayout ly bo f fs -> cat ly bo f fs
+
+-- Smart constructor for frames from domain types
+framePart :: (Monoid n, HasSize n z) => z -> Frame n b z
+framePart z = Frame (FrameF (box (getSize z)) (ElemPart z))
+
+-- frameLayout ::
+
+-- getters/setters/lenses
 
 frameBox :: Frame n b z -> Box n
 frameBox = frameBoxF . unFrame
@@ -154,39 +203,49 @@ setFrameBox (Frame (FrameF _ c)) b = Frame (FrameF b c)
 frameBoxL :: Lens' (Frame n b z) (Box n)
 frameBoxL = lens frameBox setFrameBox
 
-frameElem :: Frame n b z -> Elem b (Frame n b z) z
+frameElem :: Frame n b z -> Elem b z (Frame n b z)
 frameElem = frameContentF . unFrame
 
-setFrameElem :: Frame n b z -> Elem b (Frame n b z) z -> Frame n b z
+setFrameElem :: Frame n b z -> Elem b z (Frame n b z) -> Frame n b z
 setFrameElem (Frame (FrameF b _)) c = Frame (FrameF b c)
 
-frameElemL :: Lens' (Frame n b z) (Elem b (Frame n b z) z)
+frameElemL :: Lens' (Frame n b z) (Elem b z (Frame n b z))
 frameElemL = lens frameElem setFrameElem
 
-frameCata :: (FrameF n (Elem b x z) -> x) -> Frame n b z -> x
-frameCata f = go where go = f . fmap (first go) . unFrame
+-- How to fold frames
 
-frameCataM :: Monad m => (FrameF n (Elem b x z) -> m x) -> Frame n b z -> m x
-frameCataM f = go where go = f <=< traverse (bitraverse go pure) . unFrame
+frameCata :: (FrameF n b z r -> r) -> Frame n b z -> r
+frameCata f = go where go = f . fmap go . unFrame
 
-framePart :: (Monoid n, HasSize n z) => z -> Frame n b z
-framePart z = Frame (FrameF (box (getSize z)) (ElemPart z))
+frameCataM :: Monad m => (FrameF n b z r -> m r) -> Frame n b z -> m r
+frameCataM f = go where go = f <=< traverse go . unFrame
+
+-- Map and bind for frames - note that we have to constrain the types we can map to those
+-- we can size, so we can't implement Functor/Monad
 
 frameMap :: (SizeLike n, HasSize n w, HasFill n b) => (z -> w) -> Frame n b z -> Frame n b w
-frameMap f = frameCata (frame . fmap f . frameContentF)
+frameMap f = frameCata (frame . first f . frameContentF)
+
+frameMapM :: (Monad m, SizeLike n, HasSize n w, HasFill n b) => (z -> m w) -> Frame n b z -> m (Frame n b w)
+frameMapM f = frameCataM (fmap frame . bitraverse f pure . frameContentF)
 
 frameBind :: (SizeLike n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Frame n b z -> Frame n b w
 frameBind f = frameCata (elemBind f . frameContentF)
 
-elemBind :: (SizeLike n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Elem b (Frame n b w) z -> Frame n b w
+-- frameBindM ::
+
+elemBind :: (SizeLike n, HasSize n w, HasFill n b) => (z -> Frame n b w) -> Elem b z (Frame n b w) -> Frame n b w
 elemBind f = \case
   ElemPart z -> f z
   ElemLayout ly bo r rs -> cat ly bo r rs
 
+-- Border represented by 1-row/column of symbol in VTY
+-- True means visible.
 newtype ImBorder = ImBorder {unImBorder :: Bool}
   deriving stock (Show)
   deriving newtype (Eq, Ord)
 
+-- Border types we can get the width XOR height of
 class HasFill n b where
   getFill :: b -> n
 
@@ -196,6 +255,7 @@ instance HasFill (Sum Int) ImBorder where
 instance Monoid n => HasFill n () where
   getFill _ = mempty
 
+-- Things we can get the width AND height of
 class HasSize n a where
   getWidth :: a -> n
   getWidth = v2X . getSize
@@ -231,6 +291,7 @@ instance Monoid n => HasSize n () where
   getHeight _ = mempty
   getSize _ = mempty
 
+-- Allows us to calculate a bounding box that contains both objects
 class Widenable a where
   widen :: Layout -> a -> a -> (a, a)
 
@@ -240,6 +301,7 @@ instance Ord n => Widenable (V2 n) where
       LayoutHoriz -> let y = max y1 y2 in (V2 x1 y, V2 x2 y)
       LayoutVert -> let x = max x1 x2 in (V2 x y1, V2 x y2)
 
+-- Fits a box into a larger box with the given padding.
 fitBox :: Halvable n => V2 n -> Box n -> Box n
 fitBox (V2 dx dy) (Box ba@(BoxAlign bax bay) (V2 tlx tly) sz (V2 brx bry)) =
   let (tlx', brx') = case bax of
@@ -278,6 +340,9 @@ instance SizeLike n => Widenable (Frame n b z) where
         (b1', b2') = widen ly b1 b2
     in  (setFrameBox f1 b1', setFrameBox f2 b2')
 
+-- Allows us to vertically/horizontally stack things @a@ with borders @b@
+-- The minimal implementation is @stack@ but you may want to implement
+-- @cat@ for more compact trees.
 class Stackable b a where
   hstack :: b -> a -> a -> a
   hstack = stack LayoutHoriz
@@ -361,15 +426,107 @@ hitFrame initPos fr = goRoot
         Just _ -> pure mz
         Nothing -> goFold layOff (off <> layOff) rs
 
+data Crumb d a r = Crumb
+  { crumbUp :: !r
+  , crumbAnno :: !d
+  , crumbPrev :: !(Seq a)
+  , crumbNext :: !(Seq a)
+  } deriving stock (Eq, Ord, Show)
+
+data Zip d a = Zip { zipCrumb :: !(Maybe (Crumb d a (Zip d a))), zipContents :: !a }
+  deriving stock (Eq, Ord, Show)
+
+type ZipUp d a = d -> Seq a -> Seq a -> a -> a
+
+type ZipDown d a = a -> Maybe (d, Seq a, a)
+
+type ZipIndex d a = Int -> a -> Maybe (d, Seq a, Seq a, a)
+
+withZip :: ZipUp d b -> (Zip d a -> Zip d b) -> a -> b
+withZip f g = zipOut f . g . zipIn
+
+zipUp :: ZipUp d a -> Zip d a -> Maybe (Zip d a)
+zipUp f (Zip mc ct) = fmap (\(Crumb (Zip mc' _) d p n) -> Zip mc' (f d p n ct)) mc
+
+zipOut :: ZipUp d a -> Zip d a -> a
+zipOut f (Zip mc0 ct0) = go mc0 ct0 where
+  go mc ct = case mc of
+    Nothing -> ct
+    Just (Crumb (Zip mc' _) d p n) -> go mc' (f d p n ct)
+
+zipIn :: a -> Zip d a
+zipIn = Zip Nothing
+
+zipIndex :: ZipIndex d a -> Int -> Zip d a -> Maybe (Zip d a)
+zipIndex f ix u@(Zip _ ct) = fmap (\(d, p, n, ct') -> Zip (Just (Crumb u d p n)) ct') (f ix ct)
+
+zipDown :: ZipDown d a -> Zip d a -> Maybe (Zip d a)
+zipDown f u@(Zip _ ct) = fmap (\(d, n, ct') -> Zip (Just (Crumb u d Empty n)) ct') (f ct)
+
+zipPrev :: Zip d a -> Maybe (Zip d a)
+zipPrev (Zip mc ct) = mc >>= \(Crumb u d p n) ->
+  case p of
+    Empty -> Nothing
+    p' :|> a -> Just (Zip (Just (Crumb u d p' (ct :<| n))) a)
+
+zipNext :: Zip d a -> Maybe (Zip d a)
+zipNext (Zip mc ct) = mc >>= \(Crumb u d p n) ->
+  case n of
+    Empty -> Nothing
+    a :<| n' -> Just (Zip (Just (Crumb u d (p :|> ct) n')) a)
+
+type FrameZip n b z = Zip Layout (Frame n b z)
+
+fzUpFn :: ZipUp Layout (Frame n b z)
+fzUpFn a d p n = undefined
+
+fzIndexFn :: ZipIndex Layout (Frame n b z)
+fzIndexFn ix a = undefined
+
+fzDownFn :: ZipDown Layout (Frame n b z)
+fzDownFn a = undefined
+
+fzIn :: Frame n b z -> FrameZip n b z
+fzIn = zipIn
+
+fzUp :: FrameZip n b z -> Maybe (FrameZip n b z)
+fzUp = zipUp fzUpFn
+
+fzOut :: FrameZip n b z -> Frame n b z
+fzOut = zipOut fzUpFn
+
+fzIndex :: Int -> FrameZip n b z -> Maybe (FrameZip n b z)
+fzIndex = zipIndex fzIndexFn
+
+fzDown :: FrameZip n b z -> Maybe (FrameZip n b z)
+fzDown = zipDown fzDownFn
+
+fzMap :: (SizeLike n, HasSize n z, HasFill n b) => (z -> z) -> FrameZip n b z -> FrameZip n b z
+fzMap f (Zip mc ct) = Zip mc (frameMap f ct)
+
+-- fzMapM :: (Monad m, SizeLike n, HasSize n z, HasFill n b) => (z -> m z) -> FrameZip n b z -> FrameZip n b z
+-- fzMapM f (Zip mc ct) = fmap (Zip mc) (frameMapM f ct)
+
+withFz :: (FrameZip n b z -> FrameZip n b w) -> Frame n b z -> Frame n b w
+withFz = withZip fzUpFn
+
+-- data Hit n b z =
+--     HitBorder !Layout !b !Int
+--   | HitDomain !z
+--   | HitFrame !(FrameF n b z (Hit n b z))
+--   deriving stock (Eq, Ord, Show)
+
+-- hitFrameF :: V2 n -> FrameF n b z (Maybe (Hit n b z)) -> Maybe (Hit n b z)
+
 type ImFrame = Frame (Sum Int) ImBorder V.Image
 
 buildI :: V.Attr -> ImFrame -> V.Image
-buildI at = build @(Sum Int) @V.Image @V.Image onBorder onContent
+buildI boAttr = build @(Sum Int) @V.Image @V.Image onBorder onContent
  where
   onBorder (Sum n) ly bo =
     let (Sum z) = getFill bo
         (c, w, h) = case ly of LayoutHoriz -> ('|', z, n); LayoutVert -> ('-', n, z)
-    in  V.charFill at c w h
+    in  V.charFill boAttr c w h
   onContent (Box _ (V2 (Sum tlx) (Sum tly)) (V2 (Sum cx) (Sum cy)) (V2 (Sum brx) (Sum bry))) im =
     V.pad tlx tly brx bry (V.crop cx cy im)
 
@@ -382,12 +539,15 @@ showI im = do
     void (V.nextEvent vty)
 
 testI :: V.Attr -> ImFrame
-testI at =
+testI txAttr =
   let bo = ImBorder True
   in  hstack
         bo
-        (vstack bo (framePart (V.string at "hello")) (framePart (V.string at "world")))
-        (framePart (V.string at ":)"))
+        (vstack bo (framePart (V.string txAttr "hello")) (framePart (V.string txAttr "world")))
+        (framePart (V.string txAttr ":)"))
+
+runTestI :: IO ()
+runTestI = let at = V.defAttr in showI (buildI at (testI at))
 
 data Event n
   = EvKey !V.Key !(Set V.Modifier)
@@ -408,8 +568,6 @@ convertEv = \case
   V.EvPaste bs -> EvPaste (TE.decodeUtf8 bs)
   V.EvLostFocus -> EvLostFocus
   V.EvGainedFocus -> EvGainedFocus
-
--- newtype W a = W { unW ::
 
 data Widget m e n v = Widget
   { widgetBox :: !(Box n)
@@ -441,6 +599,7 @@ instance (Applicative m, SizeLike n, HasSize n v, HasFill n b, Stackable b v) =>
         else let p' = p <> diff in when (hitBox p bx2') (cb2 p' e)
     v = liftA2 (stack ly bo) v1 v2
 
+-- TODO implement
 -- buildW :: (Applicative m, HasSize n v) => Frame n (Widget m e n v) -> Widget m e n v
 -- buildW = build onBorder onContent where
 
@@ -448,10 +607,11 @@ newtype Id = Id {unId :: Int}
   deriving stock (Show)
   deriving newtype (Eq, Ord, Enum)
 
+-- TODO what is offset from here?
 data Ref n = Ref {refId :: !Id, refOffset :: !(V2 n)}
   deriving stock (Eq, Ord, Show)
 
-type IdFrame n b z = FrameF n (Elem b (Ref n) z)
+type IdFrame n b z = FrameF n b z (Ref n)
 
 data Focus n = Focus
   { focId :: !Id
@@ -498,7 +658,7 @@ foldState f = go Empty
     Empty -> (acc, s)
     a :<| as -> let (b, s') = f s a in go (acc :|> b) s' as
 
-addOffset :: (Group n, HasFill n b) => FrameF n (Elem b Id z) -> IdFrame n b z
+addOffset :: (Group n, HasFill n b) => FrameF n b z Id -> IdFrame n b z
 addOffset (FrameF bx c) = FrameF bx (goElem c)
  where
   goElem = \case
@@ -525,20 +685,20 @@ runX x s = runMaybeT (runStateT (unX x) s)
 evalX :: Functor m => X m a -> m (Maybe a)
 evalX x = fmap (fmap fst) (runX x Set.empty)
 
-extractFrame :: MonadFrameSt n b z s m => Id -> m (Maybe (Frame n b z))
-extractFrame = fmap (fmap Frame) . evalX . go
- where
-  go i = do
-    mjr <- lift (lookupFrame i)
-    case mjr of
-      Nothing -> empty
-      Just r -> do
-        seen <- get
-        if Set.member i seen
-          then empty
-          else do
-            modify' (Set.insert i)
-            traverse (bitraverse (fmap Frame . go . refId) pure) r
+-- extractFrame :: MonadFrameSt n b z s m => Id -> m (Maybe (Frame n b z))
+-- extractFrame = fmap (fmap Frame) . evalX . go
+--  where
+--   go i = do
+--     mjr <- lift (lookupFrame i)
+--     case mjr of
+--       Nothing -> empty
+--       Just r -> do
+--         seen <- get
+--         if Set.member i seen
+--           then empty
+--           else do
+--             modify' (Set.insert i)
+--             traverse (bitraverse pure (fmap Frame . go . refId)) r
 
 data BorderHit b = BorderHit !Layout !b !Int
 
@@ -560,16 +720,16 @@ type FrameHit n b z = FrameF n (Either (BorderHit b) z)
 --         Empty -> pure best
 --         (pos', q') :<| rest' -> go best rest' pos' q'
 
--- data Dir = DirLeft | DirRight | DirUp | DirDown
---   deriving stock (Eq, Ord, Show)
+data Dir = DirLeft | DirRight | DirUp | DirDown
+  deriving stock (Eq, Ord, Show)
 
--- keyDir :: V.Key -> Maybe Dir
--- keyDir = \case
---   V.KLeft -> Just DirLeft
---   V.KRight -> Just DirRight
---   V.KUp -> Just DirUp
---   V.KDown -> Just DirDown
---   _ -> Nothing
+keyDir :: V.Key -> Maybe Dir
+keyDir = \case
+  V.KLeft -> Just DirLeft
+  V.KRight -> Just DirRight
+  V.KUp -> Just DirUp
+  V.KDown -> Just DirDown
+  _ -> Nothing
 
 -- -- dirTargetFrame :: Dir -> M n b z (Maybe (Id, IdFrame n b z))
 -- -- dirTargetFrame dir = runMaybeT goRoot where
